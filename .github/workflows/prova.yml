@@ -17,23 +17,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14        # Apple Silicon
+          - os: macos-latest    # Apple Silicon
             python: "3.11"
           - os: windows-latest
             python: "3.12"
-          - os: ubuntu-latest
-            python: "3.9"       # versione minima supportata
+          - os: ubuntu-24.04
+            python: "3.9"       # versione minima supportata (quella degli strumenti Apple sui Mac)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
       - name: Cache degli strumenti
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: tools
           key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('setup.py') }}
