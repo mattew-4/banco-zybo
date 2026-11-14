@@ -42,9 +42,19 @@ jobs:
         run: python setup.py
 
       - name: Compila ed esegue l'esempio
-        run: >
-          python -I server/selftest.py examples/ciao_zybo.c 4 "1.0:sw 0 1;2.0:btn 1 1"
-          --expect "Ciao dalla Zybo Z7-10!" --expect "SW = 0x1  BTN = 0x2"
+        shell: bash
+        run: |
+          set +e
+          python -I server/selftest.py examples/ciao_zybo.c 4 "1.0:sw 0 1;2.0:btn 1 1" \
+            --expect "Ciao dalla Zybo Z7-10!" --expect "SW = 0x1  BTN = 0x2" > selftest.log 2>&1
+          rc=$?
+          cat selftest.log
+          if [ $rc -ne 0 ]; then
+            # le ultime righe come annotazione, leggibile anche senza scaricare i log
+            msg=$(tail -n 60 selftest.log | cut -c1-200 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=selftest::${msg}"
+          fi
+          exit $rc
 
       - name: Server web e chiusura di Renode (macOS/Linux)
         if: runner.os != 'Windows'
