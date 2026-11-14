@@ -81,7 +81,8 @@ def build(sources: dict[str, str], workdir: pathlib.Path, opts: BuildOptions) ->
 
     for name, text in sources.items():
         safe = re.sub(r"[^A-Za-z0-9_.\-]", "_", pathlib.Path(name).name)
-        (src_dir / safe).write_text(text, encoding="utf-8", newline="\n")
+        with open(src_dir / safe, "w", encoding="utf-8", newline="\n") as f:   # Python 3.9: niente write_text(newline=)
+            f.write(text)
 
     cflags = CPU_FLAGS + [opts.opt, "-I", str(src_dir), "-I", str(BSP / "generated"), "-I", str(BSP / "include")]
     if opts.warnings:
