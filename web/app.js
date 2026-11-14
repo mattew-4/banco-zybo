@@ -579,7 +579,7 @@ $("#termForm").addEventListener("submit", (e) => {
    ===================================================================== */
 let logUnread = 0;
 // avvisi interni di Renode su dettagli non modellati e irrilevanti (cache L2, SCU, bit di interrupt dell'I2C)
-const IGNORED = /pl310: Unhandled|scu: Unhandled|Unknown CP15|slcr: Unhandled write to offset 0xA1C|uart1: Unhandled write|i2c\d: Unhandled write|No action for reset/;
+const IGNORED = /pl310: Unhandled|scu: Unhandled|Unknown CP15|slcr: Unhandled write to offset 0xA1C|uart1: Unhandled write|i2c\d: Unhandled write|No action for reset|GICC_CTLR\.AckCtl/;
 function onLog(e) {
   if (IGNORED.test(e.text)) return;   // avvisi del boot Xilinx su blocchi non rilevanti (cache L2, SCU)
   const el = $("#emuLog");

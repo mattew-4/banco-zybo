@@ -194,6 +194,10 @@ class Emulator:
                 f"include @{_rp(PLATFORM / 'ZyboPeripherals.cs')}",
                 f"machine LoadPlatformDescription @{_rp(PLATFORM / 'zybo_z7_10.repl')}",
                 "cpu PerformanceInMips 667",
+                # GIC v1 dello Zynq: in ICDICFR il driver XScuGic scrive 01 (livello) o 11 (fronte); il bit
+                # basso e' il modello 1-N, che il GIC di Renode non conosce e per cui scarta la configurazione.
+                # Su un solo core non cambia nulla: lo si toglie e resta il bit livello/fronte.
+                'sysbus SetHookBeforePeripheralWrite gic "value = (value & 0xAAAAAAAA) if 0xC00 <= offset < 0xD00 else value"',
                 "ttc0 Frequency 111111115",
                 "ttc1 Frequency 111111115",
                 "logLevel 2",

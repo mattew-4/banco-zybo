@@ -145,6 +145,11 @@ Se misuri valori diversi sulla scheda, puoi cambiarli in `config.json`, nella ca
 { "timing": { "cpi": 1.51, "pl_read_ns": 1000, "pl_write_ns": 700 } }
 ```
 
+Il BSP del banco ha le stesse definizioni (`xparameters.h`) del BSP generato per il bitstream del
+corso, compreso il driver Xilinx `XLlFifo` per le FIFO. Della PL del corso non sono emulati la
+seconda AXI4-Stream FIFO (`0x43C2_0000`) e gli interrupt delle FIFO (ID 63 e 64): i loro accessi
+vengono segnalati in giallo.
+
 **Limiti del modello:** le cache e la pipeline non sono modellate. Per questo `-O1` e `-O2` danno
 tempi quasi uguali e misure ripetute danno sempre lo stesso valore, mentre sulla scheda `max` supera
 di poco `avg`. Le soglie (quale N perde campioni, il lavoro più lungo che la FIFO assorbe) sono
@@ -180,6 +185,9 @@ quelle del modello: **verificale sulla scheda**.
   risultano più alti.
 - **Tempo (Lab 3, «tempo CPU»):** il tempo è calcolato dal lavoro del Cortex-A9 (vedi sopra), quindi
   le durate misurate sono vicine a quelle della scheda, nei limiti del modello.
+- **GIC:** il driver `XScuGic` scrive in `ICDICFR` il tipo di trigger nel formato del GIC v1 dello
+  Zynq (`01` livello, `11` fronte), che il GIC di Renode non riconosce: il banco toglie il bit del
+  modello 1-N (ininfluente su un solo core), così gli interrupt configurati con il driver arrivano.
 - **Diverso:** un trasferimento I2C finisce subito. Un accesso a un indirizzo della PL senza
   periferica restituisce 0 (sulla scheda: errore di bus) e viene segnalato in giallo.
 
