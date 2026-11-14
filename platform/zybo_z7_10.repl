@@ -1,0 +1,144 @@
+// =====================================================================
+// Digilent Zybo Z7-10 (Zynq-7010, XC7Z010-1CLG400C) con il bitstream del corso
+// "Advanced Embedded Systems": PS dello Zynq-7000 + blocchi della PL.
+//
+// Il PS e' preso da platforms/cpus/zynq-7000.repl di Renode (Antmicro, licenza MIT);
+// global timer e timer privato sono sostituiti da modelli che contano in tempo reale
+// (vedi ZyboPeripherals.cs).
+// =====================================================================
+
+// ------------------------- Processing System -------------------------
+cpu: CPU.ARMv7A @ sysbus
+    cpuType: "cortex-a9"
+    genericInterruptController: gic
+
+gic: IRQControllers.ARM_GenericInterruptController @ {
+        sysbus new Bus.BusMultiRegistration { address: 0xF8F01000; size: 0x1000; region: "distributor" };
+        sysbus new Bus.BusMultiRegistration { address: 0xF8F00100; size: 0x100; region: "cpuInterface" }
+    }
+    supportsTwoSecurityStates: false
+    architectureVersion: .GICv1
+    CPUInterfaceProductIdentifier: 0x390
+    CPUInterfaceRevision: 0x2
+    CPUInterfaceImplementer: 0x43B
+
+scu: Miscellaneous.ArmSnoopControlUnit @ sysbus 0xF8F00000
+
+pmu: Miscellaneous.ArmPerformanceMonitoringUnit @ cpu
+    -> gic@5
+
+pl310: Cache.PL310 @ sysbus <0xF8F02000, +0x1000>
+
+// Timer del Cortex-A9 MPCore, PERIPHCLK = CPU/2 = 333.33 MHz, in tempo reale
+globalTimer: Zybo.A9GlobalTimer @ sysbus 0xF8F00200
+    IRQ -> gic#0@27
+
+privateTimer: Zybo.A9PrivateTimer @ sysbus 0xF8F00600
+    IRQ -> gic#0@29
+
+// eFuse: il boot.S legge EFUSE_STATUS (0xF800D010) per riconoscere uno Zynq single-core;
+// lo Zynq-7010 e' dual-core: il bit 7 vale 0
+efuse: Python.PythonPeripheral @ sysbus 0xF800D000
+    size: 0x20
+    initable: false
+    script: "request.Value = 0"
+
+memory: Memory.MappedMemory @ sysbus 0x0
+    size: 0x40000000
+
+onChipMemory: Memory.MappedMemory @ sysbus 0xFFFC0000
+    size: 0x40000
+
+uart0: UART.Cadence_UART @ sysbus 0xE0000000
+    -> gic@27
+
+// UART1 verso il bridge USB-UART: modello con FIFO che si svuota al baud rate reale
+uart1: Zybo.ZynqUart @ sysbus 0xE0001000
+    uiName: "uart1"
+    IRQ -> gic@50
+
+i2c0: I2C.Cadence_I2C @ sysbus 0xE0004000
+    -> gic@25
+
+i2c1: I2C.Cadence_I2C @ sysbus 0xE0005000
+    -> gic@48
+
+spi0: SPI.Cadence_SPI @ sysbus 0xE0006000
+    -> gic@26
+
+spi1: SPI.Cadence_SPI @ sysbus 0xE0007000
+    -> gic@49
+
+gpio: GPIOPort.XilinxGPIOPS @ sysbus 0xE000A000
+
+gem0: Network.CadenceGEM @ sysbus <0xE000B000, +0x1000>
+    -> gic@22
+
+qspi: SPI.XilinxQSPI @ sysbus <0xE000D000, +0x1000>
+    -> gic@19
+
+sdhci0: SD.SDHCI @ sysbus <0xE0100000, +0x1000>
+
+ttc0: Timers.Cadence_TTC @ sysbus 0xF8001000
+    [0-2] -> gic@[10-12]
+
+ttc1: Timers.Cadence_TTC @ sysbus 0xF8002000
+    [0-2] -> gic@[37-39]
+
+watchdog0: Timers.Cadence_WDT @ sysbus 0xF8005000
+    frequency: 33333333
+    -> gic@9
+
+xadc: Analog.Xilinx_XADC @ sysbus 0xF8007100
+    -> gic@7
+
+slcr: Miscellaneous.Zynq7000_SystemLevelControlRegisters @ sysbus 0xF8000000
+    cpu0: cpu
+
+dma_pl330: DMA.PL330_DMA @ sysbus 0xF8003000
+    numberOfSupportedEventsAndInterrupts: 16
+    numberOfSupportedPeripheralRequestInterfaces: 4
+    AbortIRQ -> gic@13
+    [0-3] -> gic@[14-17]
+    [4-7] -> gic@[40-43]
+    AXIBusWidth: 64
+    DataBufferDepth: 1
+    InstructionCacheLinesNumber: 8
+    InstructionCacheLineLength: 16
+    ReadQueueDepth: 16
+    WriteQueueDepth: 16
+    WriteIssuingCapability: 8
+    ReadIssuingCapability: 8
+
+// ------------------- Programmable Logic: bitstream del corso -------------------
+// axi_gpio_0: pulsanti BTN0..BTN3, solo ingressi, interrupt ID 61 (IRQ_F2P[0])
+btns: Zybo.AxiGpio @ sysbus 0x41200000
+    uiName: "btns"
+    width: 4
+    allInputs: true
+    interruptPresent: true
+    IRQ -> gic@29
+
+// axi_gpio_1: LED LD0..LD3, solo uscite
+leds: Zybo.AxiGpio @ sysbus 0x41210000
+    uiName: "leds"
+    width: 4
+    allOutputs: true
+
+// axi_gpio_2: switch SW0..SW3, solo ingressi, interrupt ID 62 (IRQ_F2P[1])
+sws: Zybo.AxiGpio @ sysbus 0x41220000
+    uiName: "sws"
+    width: 4
+    allInputs: true
+    interruptPresent: true
+    IRQ -> gic@30
+
+// Pmod JD: GY-521 (MPU-6050) su I2C1 tramite EMIO, indirizzo 0x68
+mpu: Zybo.Mpu6050 @ i2c1 0x68
+
+// LD4 sul pin MIO7 del GPIO del PS
+ld4: Zybo.PinProbe
+    uiName: "ld4"
+
+gpio:
+    7 -> ld4@7

@@ -1,0 +1,12 @@
+# strumenti scaricati da setup.py (~700 MB): ognuno li installa sul proprio computer
+tools/
+# file temporanei del banco
+work/
+downloads/
+bsp/obj/
+# impostazioni personali (cartella dei Lab)
+config.json
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

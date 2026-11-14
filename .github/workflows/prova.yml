@@ -1,0 +1,64 @@
+# Prova automatica su macOS (Apple Silicon), Windows e Linux:
+# installa gli strumenti con setup.py, compila ed esegue l'esempio nell'emulatore e controlla
+# il Serial Monitor; su macOS/Linux verifica anche che Renode si chiuda se il server muore.
+name: prova
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  banco:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon
+            python: "3.11"
+          - os: windows-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.9"       # versione minima supportata
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache degli strumenti
+        uses: actions/cache@v4
+        with:
+          path: tools
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('setup.py') }}
+
+      - name: Installazione strumenti (setup.py)
+        run: python setup.py
+
+      - name: Compila ed esegue l'esempio
+        run: >
+          python -I server/selftest.py examples/ciao_zybo.c 4 "1.0:sw 0 1;2.0:btn 1 1"
+          --expect "Ciao dalla Zybo Z7-10!" --expect "SW = 0x1  BTN = 0x2"
+
+      - name: Server web e chiusura di Renode (macOS/Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python -I server/app.py --no-browser > server.log 2>&1 &
+          PID=$!
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8765/api/status | grep -q '"idle"' && break; sleep 2; done
+          curl -sf http://127.0.0.1:8765/api/status
+          curl -sf http://127.0.0.1:8765/ | grep -q labsDirBtn
+          pgrep -f "tools/renode" > /dev/null || { echo "Renode non partito"; cat server.log; exit 1; }
+          kill -9 $PID                                   # il server muore di colpo...
+          sleep 6
+          if pgrep -f "tools/renode" > /dev/null; then   # ...Renode deve chiudersi da solo
+            echo "ERRORE: Renode e' rimasto acceso"; exit 1
+          fi
+          echo "OK: Renode chiuso dal guardiano"

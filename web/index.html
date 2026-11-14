@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Banco Zybo Z7-10 · emulatore</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="chip">ZYNQ-7010</span>
+    <div>
+      <h1>Banco Zybo Z7-10</h1>
+      <p class="sub">Il tuo codice compilato per Cortex-A9 ed eseguito istruzione per istruzione su uno Zynq-7000 emulato (Renode)</p>
+    </div>
+  </div>
+  <div class="status">
+    <span id="stateBadge" class="badge off">spento</span>
+    <span class="meter" title="Tempo della scheda: orologio del global timer (333,33 MHz)">⏱ <b id="boardTime">0.000</b> s</span>
+    <span class="meter" title="Istruzioni eseguite al secondo dalla CPU emulata (la scheda reale arriva a circa 667 milioni)">CPU <b id="cpuMips">–</b> MIPS</span>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ======================= COLONNA SINISTRA: CODICE ======================= -->
+  <section class="col code-col">
+    <div class="card editor-card">
+      <div class="toolbar">
+        <div class="tabs" id="fileTabs"></div>
+        <div class="tool-group">
+          <button class="btn ghost" id="newFileBtn" title="Nuovo file">＋</button>
+          <label class="btn ghost" title="Apri file .c / .h dal disco">Apri…<input type="file" id="openFile" accept=".c,.h,.s,.S" multiple hidden></label>
+          <button class="btn ghost" id="labsBtn" title="Apri un file dalla cartella dei tuoi Lab">I miei Lab</button>
+          <button class="btn ghost" id="saveFileBtn" title="Scarica il file attivo">Salva</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <pre class="gutter" id="gutter" aria-hidden="true">1</pre>
+        <textarea id="editor" spellcheck="false" wrap="off" autocapitalize="off" autocomplete="off"></textarea>
+      </div>
+      <div class="build-bar">
+        <div class="opts">
+          <label>Ottimizzazione
+            <select id="optLevel">
+              <option value="-O0">-O0 (nessuna)</option>
+              <option value="-Og">-Og (debug)</option>
+              <option value="-O1">-O1</option>
+              <option value="-O2" selected>-O2 (predefinita)</option>
+              <option value="-O3">-O3</option>
+            </select>
+          </label>
+          <label class="chk"><input type="checkbox" id="optWall" checked> -Wall -Wextra</label>
+          <label class="chk"><input type="checkbox" id="optWerror"> -Werror</label>
+          <label class="chk"><input type="checkbox" id="optG" checked> -g</label>
+          <label class="chk"><input type="checkbox" id="optLm" checked> -lm</label>
+        </div>
+        <div class="actions">
+          <button class="btn" id="buildBtn" title="Compila (Ctrl+B)">Compila</button>
+          <button class="btn primary" id="buildRunBtn" title="Compila, programma la scheda ed esegui (Ctrl+Invio)">▶ Compila ed esegui</button>
+          <label class="btn ghost" title="Esegui un .elf già compilato, per esempio scaricato dal Cortex-A9 Lab con «Download binary»">Esegui .elf…<input type="file" id="elfFile" accept=".elf" hidden></label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card out-card">
+      <div class="out-tabs">
+        <button class="otab active" data-pane="paneBuild">Compilatore</button>
+        <button class="otab" data-pane="paneAsm">Assembly ARM</button>
+        <button class="otab" data-pane="paneLog">Log emulatore <span id="logCount" class="pill hidden">0</span></button>
+        <span class="spacer"></span>
+        <a class="btn ghost small hidden" id="dlElf" href="#">Scarica .elf</a>
+      </div>
+      <div class="pane" id="paneBuild"><pre id="buildOut" class="mono out">Premi «Compila ed esegui»: il codice viene compilato con arm-none-eabi-gcc 15.2.1
+(-mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard), linkato al BSP Xilinx standalone
+e caricato in DDR a 0x0010_0000 sulla Zybo emulata.</pre></div>
+      <div class="pane hidden" id="paneAsm">
+        <div class="asm-bar"><label>Funzione <input id="asmFn" value="main" size="18"></label><button class="btn small" id="asmBtn">Mostra</button></div>
+        <pre id="asmOut" class="mono out">Compila il programma per vedere il codice A32 generato.</pre>
+      </div>
+      <div class="pane hidden" id="paneLog"><pre id="emuLog" class="mono out"></pre></div>
+    </div>
+  </section>
+
+  <!-- ======================= COLONNA DESTRA: SCHEDA ======================= -->
+  <section class="col board-col">
+    <div class="card board-card">
+      <div class="board-head">
+        <div class="run-ctl">
+          <button class="btn small" id="pauseBtn" disabled>⏸ Pausa</button>
+          <button class="btn small" id="resetBtn" disabled title="PS-SRST: riavvia lo stesso programma">⟲ Reset</button>
+          <button class="btn small" id="stopBtn" disabled>■ Ferma</button>
+        </div>
+        <div class="bounce">
+          <label title="Numero di rimbalzi dei contatti meccanici a ogni pressione / movimento">Rimbalzo <input type="range" id="bounceN" min="0" max="8" value="3"> <b id="bounceNv">3</b></label>
+          <label title="Durata del rimbalzo">in <input type="range" id="bounceMs" min="1" max="10" value="3"> <b id="bounceMsv">3</b> ms</label>
+        </div>
+      </div>
+
+      <div class="pcb" id="pcb">
+        <div class="silk name">ZYBO Z7-10</div>
+        <div class="pcb-row top-row">
+          <div class="pmod" title="Pmod JD: GY-521 (MPU-6050) su I2C1 via EMIO">
+            <div class="pmod-label">JD</div>
+            <div class="gy521" id="gy521"><span>GY-521</span><small>MPU-6050 · 0x68</small></div>
+          </div>
+          <div class="soc"><div>XC7Z010</div><small>Zynq-7000 · 2× Cortex-A9</small></div>
+          <div class="ddr">DDR3L<br><small>1 GB</small></div>
+        </div>
+
+        <div class="pcb-row ps-row">
+          <div class="ps-io">
+            <div class="ps-led"><div class="led green" id="ld4"></div><span>LD4<br><small>MIO7</small></span></div>
+            <div class="ps-btn"><button class="pbtn small" data-psbtn="50" aria-label="BTN4"></button><span>BTN4<br><small>MIO50</small></span></div>
+            <div class="ps-btn"><button class="pbtn small" data-psbtn="51" aria-label="BTN5"></button><span>BTN5<br><small>MIO51</small></span></div>
+          </div>
+          <div class="rgb" title="LED RGB: non collegato nel bitstream del corso"><div class="led rgb-off"></div><span>LD5<br><small>RGB · n.c.</small></span></div>
+        </div>
+
+        <div class="io-block">
+          <div class="io-label"><span>LED · axi_gpio_1 · 0x4121_0000</span><span class="hex" id="ledHex">0x0</span></div>
+          <div class="io-row" id="ledRow"></div>
+          <div class="io-label"><span>SWITCH · axi_gpio_2 · 0x4122_0000 · IRQ 62</span><span class="hex" id="swHex">0x0</span></div>
+          <div class="io-row" id="swRow"></div>
+          <div class="io-label"><span>PULSANTI · axi_gpio_0 · 0x4120_0000 · IRQ 61</span><span class="hex" id="btnHex">0x0</span></div>
+          <div class="io-row" id="btnRow"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card periph-card">
+      <h2>Periferiche: cosa fa davvero il tuo programma</h2>
+      <table class="periph">
+        <thead><tr><th>Blocco</th><th>Letture/s</th><th>Scritture/s</th><th>Fronti in ingresso</th><th>Linea IRQ</th><th>Interrupt</th></tr></thead>
+        <tbody>
+          <tr data-dev="btns"><td>axi_gpio_0 · pulsanti</td><td class="r">–</td><td class="w">–</td><td class="e">0</td><td><span class="lamp" id="irq-btns"></span></td><td class="n">0</td></tr>
+          <tr data-dev="leds"><td>axi_gpio_1 · LED</td><td class="r">–</td><td class="w">–</td><td class="e">–</td><td>–</td><td>–</td></tr>
+          <tr data-dev="sws"><td>axi_gpio_2 · switch</td><td class="r">–</td><td class="w">–</td><td class="e">0</td><td><span class="lamp" id="irq-sws"></span></td><td class="n">0</td></tr>
+        </tbody>
+      </table>
+      <div id="warnBox" class="warn hidden"></div>
+    </div>
+
+    <div class="card sensor-card">
+      <h2>Sensore MPU-6050 su Pmod JD <span class="muted">(I2C1 · 0xE000_5000 · indirizzo 0x68)</span></h2>
+      <div class="sensor-grid">
+        <div class="tilt-view"><div class="tilt-board" id="tiltBoard"><div class="tb-top">Zybo</div><div class="tb-gy"></div></div></div>
+        <div class="sliders">
+          <label>Pitch θ <input type="range" id="pitch" min="-90" max="90" step="0.5" value="0"> <b id="pitchv">0.0°</b></label>
+          <label>Roll φ <input type="range" id="roll" min="-180" max="180" step="0.5" value="0"> <b id="rollv">0.0°</b></label>
+          <label>Temperatura <input type="range" id="temp" min="10" max="45" step="0.1" value="28.5"> <b id="tempv">28.5 °C</b></label>
+          <label>Rumore <input type="range" id="noise" min="0" max="3" step="0.1" value="1"> <b id="noisev">×1.0</b></label>
+          <div class="sensor-btns">
+            <button class="btn small" id="levelBtn">In piano</button>
+            <button class="btn small" id="tapBtn" title="Un colpetto sulla scheda: un picco di accelerazione per 60 ms">Colpetto</button>
+            <button class="btn small" id="fingerBtn" title="Un dito sul chip per qualche secondo">Dito sul chip</button>
+          </div>
+          <div class="sensor-opts">
+            <label>WHO_AM_I <select id="whoami"><option value="114">0x72 (modulo del laboratorio)</option><option value="104">0x68 (MPU-6050 genuino)</option></select></label>
+            <label>Montaggio <select id="mount"><option value="jd">in piedi su Pmod JD (come in laboratorio)</option><option value="flat">piatto, assi allineati alla scheda</option></select></label>
+          </div>
+        </div>
+      </div>
+      <details class="i2c-log"><summary>Transazioni I2C <span class="pill" id="i2cCount">0</span></summary><pre id="i2cLog" class="mono out small"></pre></details>
+    </div>
+
+    <div class="card term-card">
+      <div class="term-head">
+        <h2>Serial Monitor <span class="muted">UART1 · 115200 8N1</span></h2>
+        <div>
+          <label class="chk small"><input type="checkbox" id="termTs"> orario</label>
+          <button class="btn ghost small" id="termClear">Pulisci</button>
+        </div>
+      </div>
+      <pre id="term" class="term" aria-live="polite"></pre>
+      <form class="term-in" id="termForm">
+        <input id="termInput" placeholder="Invia alla UART1 della scheda…" autocomplete="off">
+        <select id="termEol"><option value="\r\n">CR+LF</option><option value="\n">LF</option><option value="\r">CR</option><option value="">nessuno</option></select>
+        <button class="btn small">Invia</button>
+      </form>
+    </div>
+
+    <details class="card limits">
+      <summary>Cosa è reale e cosa no in questo emulatore</summary>
+      <ul>
+        <li><b>Reale:</b> il tuo programma è compilato per ARMv7-A (Cortex-A9) con il compilatore del corso e linkato al BSP Xilinx standalone; parte da <code>_vector_table</code> a 0x0010_0000, esegue <code>boot.S</code> (MMU, cache, stack dei modi), poi <code>main</code>. Ogni LED si accende perché il codice scrive nel registro <code>GPIO_DATA</code>; ogni interrupt passa davvero per il GIC fino alla tua ISR.</li>
+        <li><b>Reale:</b> registri e comportamento di AXI GPIO (PG144, incluso il <i>toggle-on-write</i> di IP_ISR), GIC v1, controller I2C Cadence con NACK, UART1, GPIO del PS (LD4), MPU-6050 (0x40 in PWR_MGMT_1 all'accensione, registri a 0 in sleep, rumore, offset).</li>
+        <li><b>Tempo:</b> global timer e timer privato contano in tempo reale (333,33 MHz): <code>usleep</code>, <code>XTime_GetTime</code>, lampeggi e debounce durano come sulla scheda. La pausa ferma anche l'orologio.</li>
+        <li><b>Diverso:</b> la CPU emulata è più lenta del Cortex-A9 a 667 MHz (vedi MIPS in alto) e ogni accesso a una periferica costa alcuni µs invece di ~0,1 µs: i tempi di esecuzione misurati dal programma (loops/s, µs di una funzione) sono più alti che sulla scheda.</li>
+        <li><b>Diverso:</b> la UART non rallenta al baud rate (sulla scheda 87 µs a carattere), un trasferimento I2C finisce subito invece di ~0,1 ms a byte, e un accesso a un indirizzo della PL senza periferica restituisce 0 invece di un errore di bus: l'emulatore lo segnala in giallo.</li>
+        <li><b>Non emulato:</b> codec audio SSM2603 e IP audio I2S del Lab 3; i risultati del Lab 3 dipendono dai tempi esatti del Cortex-A9 e vanno misurati sulla scheda.</li>
+      </ul>
+    </details>
+  </section>
+</main>
+
+<!-- finestra file dei Lab -->
+<dialog id="labsDlg">
+  <form method="dialog" class="dlg">
+    <h2>I miei Lab</h2>
+    <p class="muted" id="labsBase"></p>
+    <div id="labsList" class="labs-list"></div>
+    <div class="dlg-foot"><button class="btn ghost" type="button" id="labsDirBtn">Cambia cartella…</button> <button class="btn">Chiudi</button></div>
+  </form>
+</dialog>
+
+<!-- come aprire un file dei Lab -->
+<dialog id="openModeDlg">
+  <div class="dlg">
+    <h2>Aprire <span id="openModeName"></span></h2>
+    <p class="muted">I file originali nella cartella dei Lab non vengono mai modificati: nell'editor lavori su una copia.</p>
+    <div class="mode-btns">
+      <button class="btn primary" id="openReplace">Apri come nuovo progetto<small>chiude i file aperti nell'editor (scegli questo per passare a un altro esercizio)</small></button>
+      <button class="btn" id="openAdd">Aggiungi ai file aperti<small>per compilare più file insieme, ad esempio un .c e un .h</small></button>
+    </div>
+    <div class="dlg-foot"><button class="btn ghost" id="openCancel">Annulla</button></div>
+  </div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
