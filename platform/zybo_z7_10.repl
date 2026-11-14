@@ -136,6 +136,13 @@ sws: Zybo.AxiGpio @ sysbus 0x41220000
 // Pmod JD: GY-521 (MPU-6050) su I2C1 tramite EMIO, indirizzo 0x68
 mpu: Zybo.Mpu6050 @ i2c1 0x68
 
+// Percorso audio (Lab 3): codec SSM2603 su I2C0 (0x1A), AXI4-Stream FIFO e controllore I2S nella PL
+codec: Zybo.Ssm2603 @ i2c0 0x1A
+
+audioFifo: Zybo.AxiFifoMmS @ sysbus 0x43C00000
+
+i2s: Zybo.AxiI2sAdi @ sysbus 0x43C10000
+
 // LD4 sul pin MIO7 del GPIO del PS
 ld4: Zybo.PinProbe
     uiName: "ld4"

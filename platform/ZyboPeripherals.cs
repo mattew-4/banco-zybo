@@ -17,6 +17,7 @@ using System.Threading;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.I2C;
 using Antmicro.Renode.Time;
 
@@ -62,16 +63,34 @@ namespace Antmicro.Renode.Peripherals.Zybo
     }
 
     // ------------------------------------------------------------------
-    // Orologio della scheda: tempo reale (Stopwatch) che si ferma in pausa.
-    // E' la base dei timer del Cortex-A9 (global timer, timer privato), del
-    // rimbalzo dei pulsanti e del campionamento del sensore.
+    // Orologio della scheda. E' la base dei timer del Cortex-A9 (global timer,
+    // timer privato), della UART, del rimbalzo dei pulsanti, del sensore e
+    // del flusso audio. Due modalita':
+    //   RealTime  tempo reale del PC (Stopwatch) che si ferma in pausa: i LED
+    //             lampeggiano e la seriale scrive alla velocita' vera (Lab 1-2);
+    //   Cpu       tempo del Cortex-A9 calcolato dalle istruzioni eseguite e dagli
+    //             accessi ai registri (CpuClock): le durate misurate dal programma
+    //             sono quelle della scheda anche se l'emulatore e' piu' lento (Lab 3).
     // ------------------------------------------------------------------
+    public enum ClockMode { RealTime, Cpu }
+
     public static class BoardClock
     {
+        public static ClockMode Mode { get { return mode; } }
+
+        public static void SetMode(ClockMode m)
+        {
+            lock(sync) { mode = m; }
+        }
+
         public static double Seconds
         {
             get
             {
+                if(mode == ClockMode.Cpu)
+                {
+                    return CpuClock.Seconds;
+                }
                 lock(sync)
                 {
                     return accumulated + (running ? watch.Elapsed.TotalSeconds : 0);
@@ -110,6 +129,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
                 watch.Reset();
                 if(run) { watch.Start(); }
             }
+            CpuClock.Rebase(seconds);
             Scheduler.Wake();
         }
 
@@ -119,6 +139,129 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static readonly System.Diagnostics.Stopwatch watch = new System.Diagnostics.Stopwatch();
         private static double accumulated;
         private static bool running;
+        private static volatile ClockMode mode = ClockMode.RealTime;
+    }
+
+    // ------------------------------------------------------------------
+    // Tempo del Cortex-A9 (modalita' Cpu):
+    //   t = istruzioni eseguite * CPI / f_CPU  +  latenze degli accessi ai registri  +  attese saltate
+    // Il contatore di istruzioni di Renode e' esatto al confine di ogni blocco di codice.
+    // Taratura (README, "Lab 3"): CPI medio dai 157 us dell'FFT N = 512 a -O2 misurati
+    // sulla scheda; latenze dei registri della PL (bus M_AXI_GP0 + AXI4-Stream FIFO)
+    // scelte perche' a N = 4096, -O2 l'FFT stia sotto i 2666 us e si perdano comunque
+    // campioni, come descritto nel Lab 3. Le cache non sono modellate.
+    // ------------------------------------------------------------------
+    public static class CpuClock
+    {
+        public static double CyclesPerInstruction = 1.51;
+        public static double CpuHz = 666666687;
+        public static double PlReadSeconds = 1.0e-6;      // lettura di un registro nella PL
+        public static double PlWriteSeconds = 0.7e-6;     // scrittura (memoria strongly-ordered: attende la risposta)
+        public static double PsReadSeconds = 0.15e-6;     // periferiche del PS (UART, GPIO del PS)
+        public static double PsWriteSeconds = 0.10e-6;
+        public static double PrivateSeconds = 0.03e-6;    // global timer e timer privato (SCU)
+        public static double SpinStepSeconds = 1.0e-6;    // passo del salto nei cicli di attesa sul global timer
+
+        public static void Attach(IMachine m)
+        {
+            machine = m;      // la CPU si cerca al primo uso: quando nasce il timer non e' ancora sul bus
+        }
+
+        public static ulong Instructions
+        {
+            get
+            {
+                var c = cpu;
+                if(c == null && machine != null)
+                {
+                    foreach(var x in machine.SystemBus.GetCPUs())
+                    {
+                        c = cpu = x;
+                        break;
+                    }
+                }
+                return c == null ? 0 : c.ExecutedInstructions;
+            }
+        }
+
+        public static double Seconds
+        {
+            get
+            {
+                lock(sync)
+                {
+                    return NowLocked();
+                }
+            }
+        }
+
+        // tempo che passa durante un accesso a un registro (solo in modalita' Cpu)
+        public static void Charge(double seconds)
+        {
+            if(BoardClock.Mode != ClockMode.Cpu || seconds <= 0) { return; }
+            lock(sync)
+            {
+                extra += seconds;
+            }
+        }
+
+        // il programma e' in un ciclo di attesa: il tempo salta all'istante t
+        public static void AdvanceTo(double t)
+        {
+            if(BoardClock.Mode != ClockMode.Cpu) { return; }
+            lock(sync)
+            {
+                var now = NowLocked();
+                if(t > now) { extra += t - now; }
+            }
+        }
+
+        public static void Rebase(double seconds)
+        {
+            lock(sync)
+            {
+                instrBase = Instructions;
+                baseSeconds = seconds;
+                extra = 0;
+                last = seconds;
+            }
+        }
+
+        private static double NowLocked()
+        {
+            ulong i = Instructions;
+            if(i < instrBase) { instrBase = i; }           // il contatore riparte da zero al reset della CPU
+            double t = baseSeconds + (i - instrBase) * CyclesPerInstruction / CpuHz + extra;
+            if(t < last) { t = last; }
+            last = t;
+            return t;
+        }
+
+        private static readonly object sync = new object();
+        private static ICPU cpu;
+        private static IMachine machine;
+        private static ulong instrBase;
+        private static double baseSeconds, extra, last;
+    }
+
+    // Ogni accesso del processore ai registri delle periferiche del banco passa di qui:
+    // in modalita' Cpu fa trascorrere la latenza del bus ed esegue gli eventi scaduti
+    // (fronti dei pulsanti, interrupt dei timer) nell'istante giusto del tempo della CPU.
+    // Restituisce un numero d'ordine: due accessi con numeri consecutivi non hanno altri
+    // accessi in mezzo (serve a riconoscere i cicli di attesa).
+    public static class ZyboBus
+    {
+        public static long Access(double latencySeconds)
+        {
+            if(BoardClock.Mode == ClockMode.Cpu)
+            {
+                CpuClock.Charge(latencySeconds);
+                Scheduler.RunDue();
+            }
+            return Interlocked.Increment(ref seq);
+        }
+
+        private static long seq;
     }
 
     // Scheduler in tempo-scheda: esegue azioni a un istante dell'orologio della scheda
@@ -148,6 +291,25 @@ namespace Antmicro.Renode.Peripherals.Zybo
         public static void Clear()
         {
             lock(sync) { items.Clear(); }
+        }
+
+        // modalita' Cpu: esegue subito, nel thread della CPU, gli eventi gia' scaduti
+        public static void RunDue()
+        {
+            while(true)
+            {
+                Action a = null;
+                lock(sync)
+                {
+                    if(items.Count > 0 && BoardClock.Running && items[0].Key <= BoardClock.Seconds)
+                    {
+                        a = items[0].Value;
+                        items.RemoveAt(0);
+                    }
+                }
+                if(a == null) { return; }
+                try { a(); } catch(Exception) { }
+            }
         }
 
         public static void Wake()
@@ -209,6 +371,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         {
             this.frequency = frequency;
             IRQ = new GPIO();
+            CpuClock.Attach(machine);
             Reset();
         }
 
@@ -217,9 +380,19 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         // Controllo dell'orologio della scheda dal Monitor:
         //   globalTimer ClockPause / globalTimer ClockResume / globalTimer BoardSeconds
+        //   globalTimer ClockMode "cpu" | "real"   (prima di "machine Reset")
+        //   globalTimer CyclesPerInstruction 1.51, PlReadNs 1000, PlWriteNs 700  (taratura)
         public void ClockPause() { BoardClock.Pause(); }
         public void ClockResume() { BoardClock.Resume(); }
         public double BoardSeconds { get { return BoardClock.Seconds; } }
+        public string ClockMode
+        {
+            get { return BoardClock.Mode == Zybo.ClockMode.Cpu ? "cpu" : "real"; }
+            set { BoardClock.SetMode(value == "cpu" ? Zybo.ClockMode.Cpu : Zybo.ClockMode.RealTime); }
+        }
+        public double CyclesPerInstruction { get { return CpuClock.CyclesPerInstruction; } set { CpuClock.CyclesPerInstruction = value; } }
+        public double PlReadNs { get { return CpuClock.PlReadSeconds * 1e9; } set { CpuClock.PlReadSeconds = value * 1e-9; } }
+        public double PlWriteNs { get { return CpuClock.PlWriteSeconds * 1e9; } set { CpuClock.PlWriteSeconds = value * 1e-9; } }
 
         public void Reset()
         {
@@ -237,6 +410,20 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public uint ReadDoubleWord(long offset)
         {
+            var id = ZyboBus.Access(CpuClock.PrivateSeconds);
+            if(BoardClock.Mode == Zybo.ClockMode.Cpu && (offset == 0x00 || offset == 0x04))
+            {
+                // ciclo di attesa (usleep, sleep): letture del contatore una dopo l'altra, a poche
+                // istruzioni di distanza e senza altri accessi in mezzo. Dopo qualche giro il tempo
+                // avanza a passi di SpinStep per lettura: l'attesa dura lo stesso, ma l'emulatore
+                // non deve eseguirne ogni giro. Una misura con XTime_GetTime prima e dopo un
+                // calcolo non e' toccata: tra le due letture ci sono migliaia di istruzioni.
+                ulong ins = CpuClock.Instructions;
+                if(id == lastReadId + 1 && ins - lastReadInstr < 64) { spinRun++; } else { spinRun = 0; }
+                lastReadId = id;
+                lastReadInstr = ins;
+                if(spinRun >= 24) { CpuClock.Charge(CpuClock.SpinStepSeconds); }
+            }
             lock(sync)
             {
                 switch(offset)
@@ -255,6 +442,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            ZyboBus.Access(CpuClock.PrivateSeconds);
             lock(sync)
             {
                 switch(offset)
@@ -326,6 +514,9 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private ulong comparator, counterBase;
         private double timeBase;
         private long generation;
+        private long lastReadId;
+        private ulong lastReadInstr;
+        private int spinRun;
     }
 
     // ------------------------------------------------------------------
@@ -357,6 +548,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public uint ReadDoubleWord(long offset)
         {
+            ZyboBus.Access(CpuClock.PrivateSeconds);
             lock(sync)
             {
                 switch(offset)
@@ -372,6 +564,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            ZyboBus.Access(CpuClock.PrivateSeconds);
             lock(sync)
             {
                 switch(offset)
@@ -502,9 +695,21 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public uint ReadDoubleWord(long offset)
         {
+            var id = ZyboBus.Access(CpuClock.PsReadSeconds);
             lock(sync)
             {
                 Advance();
+                if(offset == 0x2C && BoardClock.Mode == ClockMode.Cpu && tx.Count >= 64 && TxEnabled && shiftStart >= 0)
+                {
+                    // xil_printf aspetta con la FIFO piena (TXFULL): al secondo giro di attesa
+                    // il tempo salta a quando il carattere in uscita e' finito di trasmettere
+                    if(id == lastFullStatusId + 1)
+                    {
+                        CpuClock.AdvanceTo(shiftStart + CharTime() * (1 + 1e-9));
+                        Advance();
+                    }
+                    lastFullStatusId = id;
+                }
                 uint v = 0;
                 switch(offset)
                 {
@@ -536,6 +741,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            ZyboBus.Access(CpuClock.PsWriteSeconds);
             lock(sync)
             {
                 Advance();
@@ -687,6 +893,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private uint cr, mr, imr, isr, baudgen, bauddiv, rxtout, rxwm, txwm, modemcr, flowdel;
         private double shiftStart;
         private long rxGen;
+        private long lastFullStatusId = -10;
     }
 
     // ------------------------------------------------------------------
@@ -733,6 +940,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         // -------- accessi del processore --------
         public uint ReadDoubleWord(long offset)
         {
+            ZyboBus.Access(CpuClock.PlReadSeconds);
             uint v = 0;
             lock(sync)
             {
@@ -753,6 +961,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            ZyboBus.Access(CpuClock.PlWriteSeconds);
             bool outChanged = false;
             lock(sync)
             {
@@ -1149,5 +1358,567 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private byte pointer;
         private double lastSampleTime;
         private double tapUntil, tapG;
+    }
+
+    // ==================================================================
+    // Percorso audio del bitstream del corso (Lab 3, cap. 8 delle dispense):
+    //
+    //   LINE IN -> SSM2603 (ADC) --I2S--> axi_i2s_adi --AXI4-Stream--> AXI4-Stream FIFO RX (512 parole) -> CPU
+    //   CPU -> AXI4-Stream FIFO TX (512 parole) --AXI4-Stream--> axi_i2s_adi --I2S--> SSM2603 (DAC) -> cuffie
+    //
+    // Il codec si configura su I2C0 (indirizzo 0x1A), i divisori dei clock sono nell'axi_i2s_adi
+    // (0x43C1_0000), i campioni passano dalla FIFO (Xilinx PG080, 0x43C0_0000).
+    // Il flusso segue l'orologio della scheda: una parola (L, poi R) ogni 1/(2 fs), sempre.
+    // Riferimenti: Analog Devices SSM2603 data sheet rev. C; ADI HDL axi_i2s_adi;
+    // AMD PG080 AXI4-Stream FIFO v4.3.
+    // ==================================================================
+    public static class AudioPath
+    {
+        public const int RxDepth = 512;
+        public const int TxDepth = 512;
+        public const double Mclk = 12288000.0;          // master clock del codec, dalla PL
+        private const double OccStep = 0.0005;           // telemetria: occupazione della FIFO ogni 0,5 ms
+        private const int UiRate = 24000;                // audio verso l'interfaccia: mono, 24 kHz
+
+        public static readonly object Sync = new object();
+
+        static AudioPath()
+        {
+            ResetCodecLocked();
+            uiTimer = new Timer(_ => Flush(), null, 50, 50);
+        }
+
+        // ---------------- comandi dall'interfaccia ----------------
+        public static void SetInput(string type, double freq, double levelDb)
+        {
+            lock(Sync)
+            {
+                Advance();
+                inType = type ?? "sine";
+                inFreq = Math.Max(1, Math.Min(23000, freq));
+                inLevelDb = Math.Max(-90, Math.Min(0, levelDb));
+            }
+        }
+
+        public static void Reset()
+        {
+            lock(Sync)
+            {
+                streaming = false; rxEn = false; txEn = false; clkCtrl = 0;
+                rxHead = rxCount = 0; txHead = txCount = 0; txPending.Clear(); txStarted = false;
+                lostWords = underWords = 0; isr = 0; ier = 0;
+                pcm.Clear(); occ.Clear(); occBin = -1; halfPending = false;
+                ResetCodecLocked();
+                resetPending = true;
+            }
+        }
+
+        // ---------------- controllore I2S (axi_i2s_adi) ----------------
+        public static uint ClockControl { get { lock(Sync) { return clkCtrl; } } }
+        public static uint Control { get { lock(Sync) { return (txEn ? 1u : 0) | (rxEn ? 2u : 0); } } }
+
+        public static void SetClockControl(uint v)
+        {
+            lock(Sync)
+            {
+                Advance();
+                clkCtrl = v & 0x00FF00FFu;
+                if(streaming) { streamT0 = BoardClock.Seconds - wordsDone / WordRate; }
+            }
+        }
+
+        public static void SetEnable(bool tx, bool rx)
+        {
+            lock(Sync)
+            {
+                Advance();
+                bool was = streaming;
+                txEn = tx; rxEn = rx;
+                streaming = tx || rx;
+                if(streaming && !was)
+                {
+                    streamT0 = BoardClock.Seconds;
+                    wordsDone = 0;
+                    occBin = -1;
+                }
+            }
+        }
+
+        // frequenza di campionamento: LRCLK = MCLK / ((BCLK_DIV + 1) * 2) / ((LRCLK_DIV + 1) * 2)
+        public static double Fs
+        {
+            get
+            {
+                int b = (int)(clkCtrl & 0xFF), l = (int)((clkCtrl >> 16) & 0xFF);
+                return Mclk / ((b + 1) * 2.0) / ((l + 1) * 2.0);
+            }
+        }
+
+        private static double WordRate { get { return 2 * Fs; } }
+
+        // istante in cui arriva (e in cui il DAC consuma) la prossima parola
+        private static double NextWordTime { get { return streamT0 + (wordsDone + 1) / WordRate + 1e-12; } }
+
+        // ---------------- AXI4-Stream FIFO (PG080) ----------------
+        public static uint FifoRead(long offset, long id)
+        {
+            lock(Sync)
+            {
+                Advance();
+                switch(offset)
+                {
+                case 0x00: return isr;
+                case 0x04: return ier;
+                case 0x0C:                                       // TDFV: posti liberi nella FIFO TX
+                {
+                    uint v = (uint)Math.Max(0, TxDepth - txCount - txPending.Count);
+                    if(v == 0 && streaming && txEn && BoardClock.Mode == ClockMode.Cpu)
+                    {
+                        if(id == lastTdfvZeroId + 1)
+                        {
+                            CpuClock.AdvanceTo(NextWordTime);    // ciclo di attesa: salta a quando il DAC prende una parola
+                            Advance();
+                            v = (uint)Math.Max(0, TxDepth - txCount - txPending.Count);
+                        }
+                        lastTdfvZeroId = id;
+                    }
+                    return v;
+                }
+                case 0x1C:                                       // RDFO: parole nella FIFO RX
+                {
+                    if(rxCount == 0 && streaming && rxEn && BoardClock.Mode == ClockMode.Cpu)
+                    {
+                        if(id == lastRdfoZeroId + 1)
+                        {
+                            CpuClock.AdvanceTo(NextWordTime);    // ciclo di attesa: salta all'arrivo della prossima parola
+                            Advance();
+                        }
+                        if(rxCount == 0) { lastRdfoZeroId = id; }
+                    }
+                    return (uint)rxCount;
+                }
+                case 0x20:                                       // RDFD: estrae una parola
+                    if(rxCount == 0)
+                    {
+                        isr |= 1u << 29;                         // RPUE: lettura con FIFO vuota
+                        return 0;
+                    }
+                    var w = rx[rxHead];
+                    rxHead = (rxHead + 1) % RxDepth;
+                    rxCount--;
+                    return w;
+                case 0x24: return (uint)rxCount * 4;            // RLR, in byte
+                case 0x2C: return tdr;
+                case 0x30: return 0;                             // RDR
+                default: return 0;
+                }
+            }
+        }
+
+        public static void FifoWrite(long offset, uint value)
+        {
+            lock(Sync)
+            {
+                Advance();
+                switch(offset)
+                {
+                case 0x00: isr &= ~value; break;                 // W1C
+                case 0x04: ier = value; break;
+                case 0x08:                                       // TDFR
+                    if(value == 0xA5) { ResetTx(); isr |= 1u << 24; }
+                    break;
+                case 0x10:                                       // TDFD
+                    if(txCount + txPending.Count >= TxDepth) { isr |= 1u << 28; }   // TPOE: FIFO piena, parola persa
+                    else { txPending.Add(value); }
+                    break;
+                case 0x14:                                       // TLR: chiude il pacchetto, che parte verso l'I2S
+                    foreach(var p in txPending)
+                    {
+                        tx[(txHead + txCount) % TxDepth] = p;
+                        txCount++;
+                    }
+                    txPending.Clear();
+                    txStarted = true;
+                    isr |= 1u << 27;                             // TC
+                    break;
+                case 0x18:                                       // RDFR
+                    if(value == 0xA5) { rxHead = rxCount = 0; isr |= 1u << 23; }
+                    break;
+                case 0x28:                                       // SRR
+                    if(value == 0xA5) { ResetTx(); rxHead = rxCount = 0; isr |= (1u << 23) | (1u << 24); }
+                    break;
+                case 0x2C: tdr = value; break;
+                }
+            }
+        }
+
+        private static void ResetTx()
+        {
+            txHead = txCount = 0;
+            txPending.Clear();
+        }
+
+        // ---------------- codec SSM2603 ----------------
+        public static void CodecWrite(int reg, int val)
+        {
+            lock(Sync)
+            {
+                Advance();
+                val &= 0x1FF;
+                if(reg == 15) { ResetCodecLocked(); }
+                else if(reg >= 0 && reg < codec.Length)
+                {
+                    codec[reg] = val;
+                    if(reg == 0 && (val & 0x100) != 0) { codec[1] = val; }   // LRINBOTH
+                    if(reg == 1 && (val & 0x100) != 0) { codec[0] = val; }   // RLINBOTH
+                    if(reg == 2 && (val & 0x100) != 0) { codec[3] = val; }   // LRHPBOTH
+                    if(reg == 3 && (val & 0x100) != 0) { codec[2] = val; }   // RLHPBOTH
+                }
+                codecDirty = true;
+            }
+        }
+
+        public static int CodecRead(int reg)
+        {
+            lock(Sync) { return reg >= 0 && reg < codec.Length ? codec[reg] : 0; }
+        }
+
+        private static void ResetCodecLocked()
+        {
+            // valori dopo il reset (data sheet SSM2603, tabella dei registri)
+            int[] d = { 0x097, 0x097, 0x079, 0x079, 0x00A, 0x008, 0x09F, 0x00A, 0x000, 0x000 };
+            for(int i = 0; i < codec.Length; i++) { codec[i] = i < d.Length ? d[i] : 0; }
+            codecDirty = true;
+        }
+
+        private static bool Active { get { return (codec[9] & 1) != 0; } }
+        private static bool PoweredOff { get { return (codec[6] & 0x80) != 0; } }
+
+        private static bool InputPath
+        {
+            // line in acceso, ADC acceso, ingresso = line (INSEL = 0), codec attivo
+            get { return Active && !PoweredOff && (codec[6] & 0x01) == 0 && (codec[6] & 0x04) == 0 && (codec[4] & 0x04) == 0; }
+        }
+
+        private static bool OutputPath
+        {
+            // DAC e uscita accesi, DAC verso l'uscita (DACSEL), DAC non silenziato (DACMU)
+            get { return Active && !PoweredOff && (codec[6] & 0x08) == 0 && (codec[6] & 0x10) == 0 && (codec[4] & 0x10) != 0 && (codec[5] & 0x08) == 0; }
+        }
+
+        private static double LineGain(int reg)
+        {
+            int v = codec[reg];
+            if((v & 0x80) != 0) { return 0; }                    // LINMUTE
+            return Math.Pow(10, ((v & 0x3F) - 0x17) * 1.5 / 20); // 0x17 = 0 dB, passi di 1,5 dB
+        }
+
+        private static double HpGain(int reg)
+        {
+            int v = codec[reg] & 0x7F;
+            if(v <= 0x2F) { return 0; }                          // muto
+            return Math.Pow(10, (v - 0x79) / 20.0);              // 0x79 = 0 dB, passi di 1 dB
+        }
+
+        // ---------------- il flusso ----------------
+        private static void Advance()
+        {
+            if(!streaming) { return; }
+            double now = BoardClock.Seconds;
+            double wr = WordRate;
+            long target = (long)Math.Floor((now - streamT0) * wr);
+            if(target <= wordsDone) { return; }
+            bool inOn = InputPath, outOn = OutputPath;
+            double gl = LineGain(0), gr = LineGain(1), hl = HpGain(2), hr = HpGain(3);
+            bool bypass = Active && (codec[4] & 0x08) != 0;
+            while(wordsDone < target)
+            {
+                long w = wordsDone;
+                bool left = (w & 1) == 0;
+                if(left) { GenerateInput(); }
+
+                // codec -> FIFO RX
+                if(rxEn)
+                {
+                    double x = inOn ? (left ? inL * gl : inR * gr) + Noise() : 0;
+                    uint word = Quantize(x);
+                    if(rxCount < RxDepth)
+                    {
+                        rx[(rxHead + rxCount) % RxDepth] = word;
+                        rxCount++;
+                    }
+                    else
+                    {
+                        lostWords++;                             // overrun: la parola non ha posto ed e' persa
+                        binOverflow = true;
+                    }
+                }
+
+                // FIFO TX -> codec
+                double y = 0;
+                if(txEn)
+                {
+                    if(txCount > 0)
+                    {
+                        y = (int)tx[txHead] / 2147483648.0;
+                        txHead = (txHead + 1) % TxDepth;
+                        txCount--;
+                    }
+                    else if(txStarted)
+                    {
+                        underWords++;                            // underrun: il DAC non ha niente da suonare
+                    }
+                }
+                double o = outOn ? y * (left ? hl : hr) : 0;
+                if(bypass) { o += (left ? inL * gl : inR * gr); }
+                double tw = streamT0 + (w + 1) / wr;
+                if(left) { outL = o; }
+                else { EmitOutput((outL + o) / 2, tw); }
+
+                // telemetria: occupazione massima della FIFO RX in ogni intervallo di 0,5 ms
+                long bin = (long)Math.Floor(tw / OccStep);
+                if(bin != occBin)
+                {
+                    if(occBin >= 0) { CloseBin(); }
+                    occBin = bin;
+                    binMax = 0;
+                }
+                if(rxCount > binMax) { binMax = rxCount; }
+                wordsDone++;
+            }
+        }
+
+        private static void CloseBin()
+        {
+            if(occ.Count == 0) { occT0 = occBin * OccStep; }
+            occ.Add(binOverflow ? -binMax - 1 : binMax);         // negativo: in questo intervallo si sono persi campioni
+            binOverflow = false;
+        }
+
+        private static void GenerateInput()
+        {
+            double fs = Fs;
+            double a = Math.Pow(10, inLevelDb / 20);
+            double v;
+            switch(inType)
+            {
+            case "silence":
+                v = 0;
+                break;
+            case "square":
+                phase += inFreq / fs; phase -= Math.Floor(phase);
+                v = phase < 0.5 ? a : -a;
+                break;
+            case "noise":
+                v = a * (rnd.NextDouble() * 2 - 1);
+                break;
+            case "sweep":                                        // da 100 Hz a 10 kHz in 4 s, poi ricomincia
+                sweepPos += 1.0 / (4 * fs); if(sweepPos >= 1) { sweepPos -= 1; }
+                phase += 100 * Math.Pow(100, sweepPos) / fs; phase -= Math.Floor(phase);
+                v = a * Math.Sin(2 * Math.PI * phase);
+                break;
+            default:
+                phase += inFreq / fs; phase -= Math.Floor(phase);
+                v = a * Math.Sin(2 * Math.PI * phase);
+                break;
+            }
+            inL = v;
+            inR = v;
+        }
+
+        private static double Noise()
+        {
+            return (rnd.NextDouble() - 0.5) * 6e-5;              // rumore del convertitore, circa -95 dBFS
+        }
+
+        private static uint Quantize(double x)
+        {
+            // campione a 24 bit in complemento a 2, allineato a sinistra nella parola a 32 bit
+            long s = (long)Math.Round(x * 8388608.0);
+            if(s > 8388607) { s = 8388607; }
+            if(s < -8388608) { s = -8388608; }
+            return (uint)((int)s << 8);
+        }
+
+        private static void EmitOutput(double mono, double t)
+        {
+            // 48 kHz -> 24 kHz per l'interfaccia: media di due campioni
+            if(!halfPending) { halfValue = mono; halfPending = true; return; }
+            halfPending = false;
+            double v = (halfValue + mono) / 2;
+            if(pcm.Count == 0) { pcmT0 = t; }
+            int s = (int)Math.Round(Math.Max(-1, Math.Min(1, v)) * 32767);
+            pcm.Add((short)s);
+        }
+
+        private static void Flush()
+        {
+            string json = null;
+            string codecJson = null;
+            bool reset = false;
+            lock(Sync)
+            {
+                try { Advance(); } catch(Exception) { }
+                if(resetPending) { reset = true; resetPending = false; }
+                if(codecDirty)
+                {
+                    codecDirty = false;
+                    codecJson = "{\"t\":\"codec\",\"regs\":[" + string.Join(",", codec) + "]}";
+                }
+                if(pcm.Count > 0 || occ.Count > 0)
+                {
+                    var bytes = new byte[pcm.Count * 2];
+                    for(int i = 0; i < pcm.Count; i++)
+                    {
+                        bytes[2 * i] = (byte)(pcm[i] & 0xFF);
+                        bytes[2 * i + 1] = (byte)((pcm[i] >> 8) & 0xFF);
+                    }
+                    var sb = new StringBuilder();
+                    sb.Append("{\"t\":\"audio\",\"vt\":").Append(ZyboUi.Num(pcmT0));
+                    sb.Append(",\"rate\":").Append(UiRate);
+                    sb.Append(",\"fs\":").Append(ZyboUi.Num(Fs));
+                    sb.Append(",\"pcm\":\"").Append(Convert.ToBase64String(bytes)).Append('"');
+                    sb.Append(",\"occT0\":").Append(ZyboUi.Num(occT0));
+                    sb.Append(",\"occStep\":").Append(ZyboUi.Num(OccStep));
+                    sb.Append(",\"occ\":[").Append(string.Join(",", occ)).Append(']');
+                    sb.Append(",\"lost\":").Append(lostWords);
+                    sb.Append(",\"under\":").Append(underWords);
+                    sb.Append(",\"level\":").Append(rxCount);
+                    sb.Append(",\"now\":").Append(ZyboUi.Num(BoardClock.Seconds));
+                    sb.Append('}');
+                    json = sb.ToString();
+                    pcm.Clear();
+                    occ.Clear();
+                }
+            }
+            if(reset) { ZyboUi.Send("{\"t\":\"audio_reset\"}"); }
+            if(codecJson != null) { ZyboUi.Send(codecJson); }
+            if(json != null) { ZyboUi.Send(json); }
+        }
+
+        private static readonly Timer uiTimer;
+        private static readonly Random rnd = new Random(12345);
+        private static readonly int[] codec = new int[19];
+        private static readonly uint[] rx = new uint[RxDepth];
+        private static readonly uint[] tx = new uint[TxDepth];
+        private static readonly List<uint> txPending = new List<uint>();
+        private static readonly List<short> pcm = new List<short>();
+        private static readonly List<int> occ = new List<int>();
+        private static bool streaming, rxEn, txEn, txStarted, codecDirty, resetPending, halfPending, binOverflow;
+        private static uint clkCtrl, isr, ier, tdr;
+        private static int rxHead, rxCount, txHead, txCount, binMax;
+        private static long wordsDone, lostWords, underWords, occBin = -1;
+        private static long lastRdfoZeroId = -10, lastTdfvZeroId = -10;
+        private static double streamT0, pcmT0, occT0, phase, sweepPos, inL, inR, outL, halfValue;
+        private static string inType = "sine";
+        private static double inFreq = 1000, inLevelDb = -12;
+    }
+
+    // axi_i2s_adi (Analog Devices), registri del controllore: RESET 0x00, CTRL 0x04, CLK_CTRL 0x08
+    public class AxiI2sAdi : IDoubleWordPeripheral, IKnownSize
+    {
+        public AxiI2sAdi(IMachine machine)
+        {
+            Reset();
+        }
+
+        public long Size { get { return 0x10000; } }
+
+        public void Reset()
+        {
+            AudioPath.Reset();
+            periodLen = 0;
+        }
+
+        // segnale su LINE IN, dal Monitor:  i2s SetInput "sine" 1000 -12
+        public void SetInput(string type, double freq, double levelDb)
+        {
+            AudioPath.SetInput(type, freq, levelDb);
+        }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            ZyboBus.Access(CpuClock.PlReadSeconds);
+            switch(offset)
+            {
+            case 0x04: return AudioPath.Control;
+            case 0x08: return AudioPath.ClockControl;
+            case 0x18: return periodLen & 0xFFFF;
+            default: return 0;
+            }
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            ZyboBus.Access(CpuClock.PlWriteSeconds);
+            switch(offset)
+            {
+            case 0x00: break;                                    // reset delle FIFO interne: nessuno stato da azzerare
+            case 0x04: AudioPath.SetEnable((value & 1) != 0, (value & 2) != 0); break;
+            case 0x08: AudioPath.SetClockControl(value); break;
+            case 0x18: periodLen = value; break;
+            }
+        }
+
+        private uint periodLen;
+    }
+
+    // AXI4-Stream FIFO (AMD PG080), interfaccia AXI4-Lite, FIFO RX e TX da 512 parole
+    public class AxiFifoMmS : IDoubleWordPeripheral, IKnownSize
+    {
+        public AxiFifoMmS(IMachine machine)
+        {
+        }
+
+        public long Size { get { return 0x10000; } }
+
+        public void Reset() { }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            var id = ZyboBus.Access(CpuClock.PlReadSeconds);
+            return AudioPath.FifoRead(offset, id);
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            ZyboBus.Access(CpuClock.PlWriteSeconds);
+            AudioPath.FifoWrite(offset, value);
+        }
+    }
+
+    // Codec audio SSM2603 su I2C: registri a 9 bit, scrittura = 2 byte
+    // (indirizzo del registro nei 7 bit alti del primo byte, bit 8 del dato nel bit 0)
+    public class Ssm2603 : II2CPeripheral
+    {
+        public Ssm2603(IMachine machine)
+        {
+        }
+
+        public void Write(byte[] data)
+        {
+            if(data.Length == 0) { return; }
+            pointer = data[0] >> 1;
+            if(data.Length >= 2)
+            {
+                int val = ((data[0] & 1) << 8) | data[1];
+                AudioPath.CodecWrite(pointer, val);
+            }
+        }
+
+        public byte[] Read(int count = 1)
+        {
+            var v = AudioPath.CodecRead(pointer);
+            var r = new byte[count];
+            if(count > 0) { r[0] = (byte)((v >> 8) & 1); }
+            if(count > 1) { r[1] = (byte)(v & 0xFF); }
+            return r;
+        }
+
+        public void FinishTransmission() { }
+
+        public void Reset() { pointer = 0; }
+
+        private int pointer;
     }
 }

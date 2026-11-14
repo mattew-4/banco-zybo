@@ -56,6 +56,20 @@ jobs:
           fi
           exit $rc
 
+      - name: Percorso audio del Lab 3 (codec, FIFO, tempo CPU)
+        shell: bash
+        run: |
+          set +e
+          python -I server/selftest.py examples/audio_passthrough.c 30 --input "sine 1000 -12" \
+            --expect "passthrough attivo" --expect "picco -12 dBFS  FIFO piena 0 volte" > audio.log 2>&1
+          rc=$?
+          cat audio.log
+          if [ $rc -ne 0 ]; then
+            msg=$(tail -n 60 audio.log | cut -c1-200 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=audio::${msg}"
+          fi
+          exit $rc
+
       - name: Server web e chiusura di Renode (macOS/Linux)
         if: runner.os != 'Windows'
         shell: bash

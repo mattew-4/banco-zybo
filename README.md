@@ -101,7 +101,54 @@ sh "Avvia Banco Zybo.command"
 - **Esegui .elf…:** esegue un binario già compilato, per esempio quello scaricato dal Cortex-A9 Lab
   con «Download binary».
 
-Nella cartella `examples/` c'è un programma di partenza.
+Nella cartella `examples/` ci sono un programma di partenza (`ciao_zybo.c`) e un passthrough audio
+(`audio_passthrough.c`).
+
+### Lab 3: audio e tempi
+
+Il banco emula anche il percorso audio del bitstream del corso: codec **SSM2603** su I2C0,
+controllore **axi_i2s_adi** e **AXI4-Stream FIFO** con FIFO RX e TX da 512 parole. Il programma
+del Lab 3 gira senza modifiche:
+
+- **dall'IDE del corso:** compila il progetto `lab3_audio`, scaricalo con «Download binary» e
+  aprilo con **Esegui .elf…**;
+- **nel banco:** copia `main.c`, `audio_io.h` e `fft.h` del progetto in una cartella dei tuoi Lab,
+  apri `main.c` con «I miei Lab» → *Apri come nuovo progetto*, poi aggiungi i due `.h` con
+  *Aggiungi ai file aperti*, e premi «Compila ed esegui».
+
+Quando il programma usa l'audio compare il pannello **Audio · Lab 3**, con queste parti:
+- **LINE IN**: il generatore di segnale che sostituisce il telefono (sinusoide, onda quadra, sweep,
+  rumore, silenzio), regolabile anche mentre il programma gira;
+- lo **stato del codec**, letto dai registri che il programma ha scritto;
+- l'**occupazione della FIFO RX** negli ultimi 0,5 s: in rosso i tratti in cui la FIFO era piena e
+  le parole si perdevano;
+- i contatori di parole perse (overrun) e di underrun del DAC;
+- l'**oscilloscopio** delle cuffie e il pulsante **Ascolta**.
+
+**L'orologio «tempo CPU».** Per il Lab 3 conta il tempo che il programma misura con
+`XTime_GetTime`. L'emulatore è più lento della scheda, quindi per i programmi con audio il banco usa
+un orologio calcolato dal lavoro del Cortex-A9: le istruzioni eseguite, a 667 MHz, più il costo di
+ogni accesso ai registri. Le durate misurate dal programma sono quindi quelle della scheda, mentre
+l'emulazione procede più lenta del reale (da circa ×0,6 a ×0,1, secondo il carico). L'audio si
+ascolta in differita, a velocità vera, con «Ascolta». La scelta è automatica; si può forzare con il
+menu **Orologio** sotto l'editor.
+
+Il modello ha tre parametri. I valori predefiniti riproducono quanto descritto nel testo del Lab 3:
+| Parametro | Valore | Da dove viene |
+|---|---|---|
+| Cicli per istruzione | 1,51 | i 157 µs dell'FFT N = 512 a `-O2` misurati sulla scheda |
+| Lettura di un registro della PL | 1 µs | bus M_AXI_GP0 + AXI4-Stream FIFO |
+| Scrittura di un registro della PL | 0,7 µs | memoria strongly-ordered: il processore attende la risposta |
+
+Se misuri valori diversi sulla scheda, puoi cambiarli in `config.json`, nella cartella del banco:
+```json
+{ "timing": { "cpi": 1.51, "pl_read_ns": 1000, "pl_write_ns": 700 } }
+```
+
+**Limiti del modello:** le cache e la pipeline non sono modellate. Per questo `-O1` e `-O2` danno
+tempi quasi uguali e misure ripetute danno sempre lo stesso valore, mentre sulla scheda `max` supera
+di poco `avg`. Le soglie (quale N perde campioni, il lavoro più lungo che la FIFO assorbe) sono
+quelle del modello: **verificale sulla scheda**.
 
 ---
 
@@ -113,10 +160,13 @@ Nella cartella `examples/` c'è un programma di partenza.
 | `axi_gpio_1`, LED LD0-3 | `0x4121_0000` | |
 | `axi_gpio_2`, switch SW0-3 | `0x4122_0000` | IRQ 62 |
 | GIC v1 (distributor / CPU interface) | `0xF8F0_1000` / `0xF8F0_0100` | |
-| Global timer / timer privato | `0xF8F0_0200` / `0xF8F0_0600` | 333,33 MHz in **tempo reale** |
-| UART1 (Serial Monitor) | `0xE000_1000` | 115200 8N1, FIFO 64 byte svuotata al baud rate reale, IRQ 82 |
+| Global timer / timer privato | `0xF8F0_0200` / `0xF8F0_0600` | 333,33 MHz, in tempo reale oppure in tempo CPU |
+| UART1 (Serial Monitor) | `0xE000_1000` | 115200 8N1, FIFO 64 byte svuotata al baud rate, IRQ 82 |
 | I2C1 + MPU-6050 (GY-521 su Pmod JD) | `0xE000_5000`, slave `0x68` | WHO_AM_I 0x72, NACK a 0x69 |
 | GPIO del PS: LD4 (MIO7), BTN4/5 (MIO50/51) | `0xE000_A000` | |
+| I2C0 + codec SSM2603 | `0xE000_4000`, slave `0x1A` | registri a 9 bit: guadagni, accensione, formato |
+| AXI4-Stream FIFO (PG080) | `0x43C0_0000` | RX e TX da 512 parole, `RDFO`, `RDFD`, `TDFV`, `TDFD`, `TLR` |
+| axi_i2s_adi | `0x43C1_0000` | fs dai divisori di `CLK_CTRL`: 48 kHz con i valori del corso |
 
 ### Quanto è fedele
 
@@ -124,13 +174,14 @@ Nella cartella `examples/` c'è un programma di partenza.
   [Renode](https://renode.io). I LED si accendono perché il programma scrive nei registri, e gli
   interrupt passano dal GIC alla tua ISR. I registri seguono i manuali: AXI GPIO PG144, UART e I2C
   UG585, timer del Cortex-A9 MPCore TRM, MPU-6050 rev. 4.2.
-- **Tempo:** timer, `usleep`, `XTime_GetTime`, UART e rimbalzi usano l'orologio reale. Una riga
-  stampata impiega lo stesso tempo che sulla scheda.
-- **Diverso:** la CPU emulata è più lenta del Cortex-A9 a 667 MHz, quindi i tempi di *esecuzione*
-  misurati dal programma risultano più alti. Un trasferimento I2C finisce subito. Un accesso a un
-  indirizzo della PL senza periferica restituisce 0 (sulla scheda: errore di bus) e viene segnalato
-  in giallo.
-- **Non emulato:** codec audio SSM2603 / IP audio del Lab 3.
+- **Tempo (Lab 1-2, «tempo reale»):** timer, `usleep`, `XTime_GetTime`, UART e rimbalzi usano
+  l'orologio reale, e una riga stampata impiega lo stesso tempo che sulla scheda. La CPU emulata
+  però è più lenta del Cortex-A9 a 667 MHz, quindi i tempi di *esecuzione* misurati dal programma
+  risultano più alti.
+- **Tempo (Lab 3, «tempo CPU»):** il tempo è calcolato dal lavoro del Cortex-A9 (vedi sopra), quindi
+  le durate misurate sono vicine a quelle della scheda, nei limiti del modello.
+- **Diverso:** un trasferimento I2C finisce subito. Un accesso a un indirizzo della PL senza
+  periferica restituisce 0 (sulla scheda: errore di bus) e viene segnalato in giallo.
 
 **Il banco serve per provare e capire il codice. I risultati da consegnare, soprattutto le misure
 di tempo, vanno verificati sulla scheda vera.**

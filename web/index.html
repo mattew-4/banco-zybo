@@ -19,6 +19,7 @@
     <span id="stateBadge" class="badge off">spento</span>
     <span class="meter" title="Tempo della scheda: orologio del global timer (333,33 MHz)">⏱ <b id="boardTime">0.000</b> s</span>
     <span class="meter" title="Istruzioni eseguite al secondo dalla CPU emulata (la scheda reale arriva a circa 667 milioni)">CPU <b id="cpuMips">–</b> MIPS</span>
+    <span class="meter" id="clockMeter" title="Orologio della scheda in questa esecuzione">🕓 <b id="clockNow">–</b></span>
   </div>
 </header>
 
@@ -54,6 +55,13 @@
           <label class="chk"><input type="checkbox" id="optWerror"> -Werror</label>
           <label class="chk"><input type="checkbox" id="optG" checked> -g</label>
           <label class="chk"><input type="checkbox" id="optLm" checked> -lm</label>
+          <label title="Tempo reale: il programma va alla velocità del PC (Lab 1-2). Tempo CPU: il tempo misurato dal programma è quello del Cortex-A9 a 667 MHz, anche se l'emulazione è più lenta (Lab 3). Automatico: tempo CPU se il programma usa il percorso audio.">Orologio
+            <select id="clockSel">
+              <option value="auto" selected>automatico</option>
+              <option value="real">tempo reale</option>
+              <option value="cpu">tempo CPU (Lab 3)</option>
+            </select>
+          </label>
         </div>
         <div class="actions">
           <button class="btn" id="buildBtn" title="Compila (Ctrl+B)">Compila</button>
@@ -128,6 +136,42 @@ e caricato in DDR a 0x0010_0000 sulla Zybo emulata.</pre></div>
       </div>
     </div>
 
+    <div class="card audio-card" id="audioCard">
+      <h2>Audio · Lab 3 <span class="muted">LINE IN → SSM2603 → axi_i2s_adi → AXI4-Stream FIFO (0x43C0_0000) → CPU → cuffie</span></h2>
+      <div class="audio-codec" id="codecState">Codec SSM2603 (I2C0 · 0x1A): non ancora configurato dal programma.</div>
+      <div class="audio-in">
+        <span class="lbl">LINE IN</span>
+        <select id="ainType">
+          <option value="sine" selected>sinusoide</option>
+          <option value="square">onda quadra</option>
+          <option value="sweep">sweep 100 Hz – 10 kHz</option>
+          <option value="noise">rumore bianco</option>
+          <option value="silence">silenzio</option>
+        </select>
+        <label>f <input type="number" id="ainFreq" min="20" max="23000" step="1" value="1000"> Hz</label>
+        <label>livello <input type="range" id="ainLevel" min="-60" max="0" step="1" value="-12"> <b id="ainLevelv">-12 dBFS</b></label>
+      </div>
+      <div class="fifo-head">
+        <span>FIFO RX: parole in attesa (K = 512) · ultimi <b id="fifoSpan">0,5</b> s</span>
+        <span>ora <b id="fifoNow">–</b> · max <b id="fifoMax">–</b></span>
+      </div>
+      <canvas id="fifoCanvas" class="fifo-canvas" width="560" height="110"></canvas>
+      <div class="audio-stats">
+        <div title="Parole (L o R) arrivate dal codec con la FIFO RX piena: perse. Il «lost» del programma del lab conta invece gli hop dopo cui la FIFO era piena."><span>Parole perse (overrun)</span><b id="lostTot">0</b><small>nell'ultimo secondo della scheda: <b id="lostSec">0</b></small></div>
+        <div><span>Underrun del DAC</span><b id="underTot">0</b><small>parole senza dati</small></div>
+        <div><span>Simulazione</span><b id="simSpeed">–</b><small>rispetto al tempo reale</small></div>
+      </div>
+      <div class="hp-head">
+        <span>Cuffie (HPH OUT): ultimi 20 ms</span>
+        <span>
+          <button class="btn small" id="listenBtn" title="Riproduce gli ultimi secondi dell'uscita delle cuffie, alla velocità vera">▶ Ascolta gli ultimi <select id="listenSecs"><option>3</option><option selected>5</option><option>10</option></select> s</button>
+          <button class="btn small ghost" id="listenStop">■</button>
+        </span>
+      </div>
+      <canvas id="scopeCanvas" class="scope-canvas" width="560" height="90"></canvas>
+      <p class="muted small audio-note" id="audioNote">L'emulatore è più lento della scheda: i tempi misurati dal programma sono quelli del Cortex-A9 (orologio «tempo CPU»), mentre l'audio si ascolta in differita, a velocità vera, con «Ascolta».</p>
+    </div>
+
     <div class="card periph-card">
       <h2>Periferiche: cosa fa davvero il tuo programma</h2>
       <table class="periph">
@@ -185,10 +229,10 @@ e caricato in DDR a 0x0010_0000 sulla Zybo emulata.</pre></div>
       <ul>
         <li><b>Reale:</b> il tuo programma è compilato per ARMv7-A (Cortex-A9) con il compilatore del corso e linkato al BSP Xilinx standalone; parte da <code>_vector_table</code> a 0x0010_0000, esegue <code>boot.S</code> (MMU, cache, stack dei modi), poi <code>main</code>. Ogni LED si accende perché il codice scrive nel registro <code>GPIO_DATA</code>; ogni interrupt passa davvero per il GIC fino alla tua ISR.</li>
         <li><b>Reale:</b> registri e comportamento di AXI GPIO (PG144, incluso il <i>toggle-on-write</i> di IP_ISR), GIC v1, controller I2C Cadence con NACK, UART1, GPIO del PS (LD4), MPU-6050 (0x40 in PWR_MGMT_1 all'accensione, registri a 0 in sleep, rumore, offset).</li>
-        <li><b>Tempo:</b> global timer e timer privato contano in tempo reale (333,33 MHz): <code>usleep</code>, <code>XTime_GetTime</code>, lampeggi e debounce durano come sulla scheda. La pausa ferma anche l'orologio.</li>
-        <li><b>Diverso:</b> la CPU emulata è più lenta del Cortex-A9 a 667 MHz (vedi MIPS in alto) e ogni accesso a una periferica costa alcuni µs invece di ~0,1 µs: i tempi di esecuzione misurati dal programma (loops/s, µs di una funzione) sono più alti che sulla scheda.</li>
-        <li><b>Diverso:</b> la UART non rallenta al baud rate (sulla scheda 87 µs a carattere), un trasferimento I2C finisce subito invece di ~0,1 ms a byte, e un accesso a un indirizzo della PL senza periferica restituisce 0 invece di un errore di bus: l'emulatore lo segnala in giallo.</li>
-        <li><b>Non emulato:</b> codec audio SSM2603 e IP audio I2S del Lab 3; i risultati del Lab 3 dipendono dai tempi esatti del Cortex-A9 e vanno misurati sulla scheda.</li>
+        <li><b>Orologio «tempo reale»</b> (Lab 1-2): global timer e timer privato contano in tempo reale (333,33 MHz): <code>usleep</code>, <code>XTime_GetTime</code>, lampeggi e debounce durano come sulla scheda e la UART esce al baud rate. Ma la CPU emulata è più lenta del Cortex-A9 a 667 MHz: i tempi di <i>esecuzione</i> misurati dal programma sono più alti che sulla scheda.</li>
+        <li><b>Orologio «tempo CPU»</b> (Lab 3, scelto da solo se il programma usa l'audio): il tempo della scheda si calcola dalle istruzioni eseguite (in media 1,51 cicli a istruzione a 667 MHz, tarato sui 157 µs dell'FFT N = 512 a -O2 del Lab 3) più il costo degli accessi ai registri (PL ~1 µs in lettura e 0,7 µs in scrittura, UART ~0,15 µs). Le durate misurate dal programma sono quelle del Cortex-A9 anche se l'emulazione è più lenta. Le cache non sono modellate: -O1 e -O2 risultano quasi uguali, e misure ripetute danno sempre lo stesso valore (sulla scheda max e media differiscono di poco).</li>
+        <li><b>Audio (Lab 3):</b> codec SSM2603 su I2C0 (registri, guadagni, accensione), controllore axi_i2s_adi (fs dai divisori del clock) e AXI4-Stream FIFO PG080 con FIFO RX e TX da 512 parole: il codec consegna una parola ogni 10,4 µs che il programma legga o no, le parole in più si perdono (overrun) e il DAC suona silenzio se manca un campione (underrun). LINE IN è un generatore di segnale; l'uscita si ascolta in differita.</li>
+        <li><b>Diverso:</b> un trasferimento I2C finisce subito invece di ~0,1 ms a byte, e un accesso a un indirizzo della PL senza periferica restituisce 0 invece di un errore di bus: l'emulatore lo segnala in giallo.</li>
       </ul>
     </details>
   </section>

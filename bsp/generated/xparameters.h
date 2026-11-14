@@ -37,6 +37,17 @@
 #define XPAR_PS7_RAM_1_S_AXI_HIGHADDR 0xFFFFFDFF
 
 /******************************************************************/
+/* Percorso audio nella PL (bitstream del corso, Lab 3):
+ * AXI4-Stream FIFO (PG080) con FIFO RX/TX da 512 parole e controllore I2S
+ * axi_i2s_adi verso il codec SSM2603 (configurato su I2C0, indirizzo 0x1A) */
+#define XPAR_AXI_FIFO_MM_S_0_BASEADDR 0x43C00000
+#define XPAR_AXI_FIFO_MM_S_0_HIGHADDR 0x43C0FFFF
+#define XPAR_AXI_FIFO_MM_S_0_DEVICE_ID 0
+#define XPAR_AXI_FIFO_MM_S_0_DATA_INTERFACE_TYPE 0
+#define XPAR_AXI_I2S_ADI_0_S00_AXI_BASEADDR 0x43C10000
+#define XPAR_AXI_I2S_ADI_0_S00_AXI_HIGHADDR 0x43C1FFFF
+
+/******************************************************************/
 /* AXI GPIO nella PL (bitstream del corso) */
 #define XPAR_XGPIO_NUM_INSTANCES 3
 

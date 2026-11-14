@@ -37,6 +37,13 @@ PS7_INIT_UART1 = [
     "sysbus WriteDoubleWord 0xE0001000 0x17",   # CR: reset FIFO, RX e TX abilitati
 ]
 
+# Modello dei tempi in modalita' "tempo CPU" (README, "Lab 3"):
+#   cpi          cicli medi per istruzione a 667 MHz: 1,51 riproduce i 157 us dell'FFT N = 512 a -O2
+#                misurati sulla scheda (testo del Lab 3)
+#   pl_read_ns   lettura di un registro nella PL (bus M_AXI_GP0, AXI4-Stream FIFO, AXI GPIO)
+#   pl_write_ns  scrittura (memoria strongly-ordered: il processore attende la risposta)
+TIMING_DEFAULTS = {"cpi": 1.51, "pl_read_ns": 1000.0, "pl_write_ns": 700.0}
+
 _ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\xff[\xfb-\xfe].|\xff\xfa.*?\xff\xf0|[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
@@ -86,6 +93,41 @@ def _kill_with_parent(proc: subprocess.Popen):
 _JOBS: list = []
 
 
+def uses_audio(elf: pathlib.Path) -> bool:
+    """True se il programma accede al percorso audio della PL (FIFO 0x43C0_0000, I2S 0x43C1_0000).
+
+    Cerca nelle sezioni di codice dell'ELF le istruzioni ARM "movt rX, #0x43C0/0x43C1" e le costanti
+    0x43C0xxxx/0x43C1xxxx: e' cosi' che il compilatore costruisce quegli indirizzi. Funziona anche
+    con un .elf compilato altrove (per esempio scaricato dall'IDE del corso)."""
+    try:
+        data = pathlib.Path(elf).read_bytes()
+        if data[:4] != b"\x7fELF" or data[4] != 1:
+            return False
+        shoff = int.from_bytes(data[0x20:0x24], "little")
+        shentsize = int.from_bytes(data[0x2E:0x30], "little")
+        shnum = int.from_bytes(data[0x30:0x32], "little")
+        for k in range(shnum):
+            h = data[shoff + k * shentsize: shoff + (k + 1) * shentsize]
+            sh_type = int.from_bytes(h[4:8], "little")
+            sh_flags = int.from_bytes(h[8:12], "little")
+            off = int.from_bytes(h[16:20], "little")
+            size = int.from_bytes(h[20:24], "little")
+            # solo il codice (PROGBITS eseguibili, con le costanti accanto alle istruzioni): la tabella
+            # della MMU del BSP contiene la base di ogni MB, 0x43C0_0000 compreso, e va esclusa
+            if sh_type != 1 or not (sh_flags & 0x4):
+                continue
+            sec = data[off:off + size]
+            for i in range(0, len(sec) - 3, 4):
+                w = int.from_bytes(sec[i:i + 4], "little")
+                # movt rX, #0x43C0 / #0x43C1 (senza condizione), oppure la costante 0x43C0_00xx / 0x43C1_00xx
+                # (indirizzo di un registro: i 16 bit bassi sono un offset piccolo, non parte di un'istruzione)
+                if (w & 0xFFFF0FFF) in (0xE34403C0, 0xE34403C1) or (w & 0xFFFEFF00) == 0x43C00000:
+                    return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def _free_port(kind=socket.SOCK_STREAM) -> int:
     s = socket.socket(socket.AF_INET, kind)
     s.bind(("127.0.0.1", 0))
@@ -110,6 +152,8 @@ class Emulator:
         self.state = "off"            # off, booting, idle, running, paused
         self.elf: pathlib.Path | None = None
         self.instructions: int | None = None
+        self.clock = "real"
+        self.last_run: dict = {}
         self._cmdq: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -209,26 +253,56 @@ class Emulator:
         self._set_state("off")
 
     # ------------------------------------------------------------------
-    def run(self, elf: pathlib.Path, sensor: dict | None = None) -> bool:
-        """Programma la scheda con l'ELF e la avvia (reset + load + run)."""
+    def run(self, elf: pathlib.Path, sensor: dict | None = None, clock: str = "auto",
+            audio: dict | None = None, timing: dict | None = None) -> bool:
+        """Programma la scheda con l'ELF e la avvia (reset + load + run).
+
+        clock: "real" (tempo reale del PC), "cpu" (tempo calcolato dalle istruzioni del Cortex-A9,
+        per il Lab 3) oppure "auto": "cpu" se il programma usa il percorso audio, altrimenti "real"."""
         if not self.boot():
             return False
         elf = pathlib.Path(elf).resolve()
         self.elf = elf
         self.instructions = None
+        audio_prog = uses_audio(elf)
+        mode = clock if clock in ("real", "cpu") else ("cpu" if audio_prog else "real")
+        self.clock = mode
+        self.last_run = {"sensor": sensor, "clock": clock, "audio": audio}
+        # taratura del tempo CPU (config.json, "timing"): cicli per istruzione e latenze dei registri della PL
+        t = dict(TIMING_DEFAULTS)
+        for k, v in (timing or {}).items():
+            if k in t and isinstance(v, (int, float)) and v > 0:
+                t[k] = float(v)
         cmds = [
             "pause",
+            f"globalTimer CyclesPerInstruction {t['cpi']:.4f}",
+            f"globalTimer PlReadNs {t['pl_read_ns']:.1f}",
+            f"globalTimer PlWriteNs {t['pl_write_ns']:.1f}",
+            f'globalTimer ClockMode "{mode}"',
             "machine Reset",                       # reset di CPU e periferiche, orologio a 0
             f"sysbus LoadELF @{_rp(elf)}",         # come l'agente: ELF in DDR, PC = _vector_table
             *PS7_INIT_UART1,
         ]
         if sensor:
             cmds += self._sensor_cmds(sensor)
+        if audio:
+            cmds += self._audio_cmds(audio)
         cmds += ["start", "globalTimer ClockResume"]
         for c in cmds:
             self.send(c)
-        self._set_state("running", wall=time.time(), elf=elf.name)
+        self._set_state("running", wall=time.time(), elf=elf.name, clock=mode, audio=audio_prog)
         return True
+
+    def set_audio_input(self, audio: dict):
+        for c in self._audio_cmds(audio):
+            self.send(c)
+
+    @staticmethod
+    def _audio_cmds(a: dict) -> list[str]:
+        kind = a.get("type", "sine")
+        if kind not in ("sine", "square", "sweep", "noise", "silence"):
+            kind = "sine"
+        return [f'i2s SetInput "{kind}" {float(a.get("freq", 1000)):.2f} {float(a.get("level", -12)):.2f}']
 
     def pause(self):
         if self.state == "running":

@@ -592,6 +592,170 @@ function onLog(e) {
 }
 
 /* =====================================================================
+   Audio (Lab 3): codec, FIFO, cuffie
+   ===================================================================== */
+const AUD_RATE = 24000, AUD_KEEP = 12 * AUD_RATE, OCC_KEEP = 1000;
+const aud = { pcm: new Float32Array(AUD_KEEP), w: 0, filled: 0, occ: [], lost: 0, under: 0, level: 0,
+              lostHist: [], speed: [], now: 0, drawPending: false, ctx: null, src: null };
+function audReset() {
+  aud.pcm.fill(0); aud.w = 0; aud.filled = 0; aud.occ = []; aud.lost = 0; aud.under = 0; aud.level = 0;
+  aud.lostHist = []; aud.speed = [];
+  ["#lostTot", "#lostSec", "#underTot"].forEach((s) => { $(s).textContent = "0"; $(s).classList.remove("bad"); });
+  $("#simSpeed").textContent = "–"; $("#fifoNow").textContent = "–"; $("#fifoMax").textContent = "–";
+  drawAudio();
+}
+function showAudioCard(on) { $("#audioCard").classList.toggle("hidden", !on); }
+function onAudio(e) {
+  showAudioCard(true);
+  const bin = atob(e.pcm || "");
+  const n = bin.length >> 1;
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v & 0x8000) v -= 0x10000;
+    aud.pcm[aud.w] = v / 32768;
+    aud.w = (aud.w + 1) % AUD_KEEP;
+  }
+  aud.filled = Math.min(AUD_KEEP, aud.filled + n);
+  for (const v of e.occ || []) aud.occ.push(v);
+  if (aud.occ.length > OCC_KEEP) aud.occ.splice(0, aud.occ.length - OCC_KEEP);
+  aud.lost = e.lost; aud.under = e.under; aud.level = e.level; aud.now = e.now;
+  aud.lostHist.push([e.now, e.lost]);
+  while (aud.lostHist.length > 2 && aud.lostHist[1][0] < e.now - 1) aud.lostHist.shift();
+  const wall = performance.now() / 1000;
+  aud.speed.push([wall, e.now]);
+  while (aud.speed.length > 2 && aud.speed[0][0] < wall - 4) aud.speed.shift();
+  $("#boardTime").textContent = (+e.now).toFixed(3);
+  if (!aud.drawPending) { aud.drawPending = true; requestAnimationFrame(() => { aud.drawPending = false; drawAudio(); }); }
+}
+function drawAudio() {
+  // contatori
+  $("#lostTot").textContent = aud.lost.toLocaleString("it-IT");
+  $("#lostTot").classList.toggle("bad", aud.lost > 0);
+  const h0 = aud.lostHist[0];
+  const ls = h0 ? aud.lost - h0[1] : 0;
+  $("#lostSec").textContent = ls.toLocaleString("it-IT");
+  $("#lostSec").classList.toggle("bad", ls > 0);
+  $("#underTot").textContent = aud.under.toLocaleString("it-IT");
+  if (aud.speed.length > 1) {
+    const a = aud.speed[0], b = aud.speed[aud.speed.length - 1];
+    if (b[0] - a[0] > 0.5) $("#simSpeed").textContent = "×" + ((b[1] - a[1]) / (b[0] - a[0])).toFixed(2).replace(".", ",");
+  }
+  // occupazione della FIFO RX: un valore ogni 0,5 ms, negativo = parole perse in quell'intervallo
+  const cv = $("#fifoCanvas"), g = cv.getContext("2d"), W = cv.width, H = cv.height;
+  g.clearRect(0, 0, W, H);
+  const top = 8, hh = H - top - 4;
+  g.strokeStyle = "#ff5c6c"; g.setLineDash([5, 4]); g.beginPath(); g.moveTo(0, top); g.lineTo(W, top); g.stroke(); g.setLineDash([]);
+  g.font = "10px monospace";
+  const kl = "K = 512: piena, le parole nuove si perdono";
+  g.fillStyle = "rgba(11,15,20,.85)"; g.fillRect(3, top + 2, g.measureText(kl).width + 8, 13);
+  g.fillStyle = "#8a96a5"; g.fillText(kl, 7, top + 12);
+  const occ = aud.occ, n = occ.length;
+  let mx = 0;
+  if (n) {
+    const per = OCC_KEEP / W;
+    for (let x = 0; x < W; x++) {
+      const i0 = Math.floor(n - OCC_KEEP + x * per), i1 = Math.floor(n - OCC_KEEP + (x + 1) * per);
+      let v = -1, lost = false;
+      for (let i = Math.max(0, i0); i < Math.min(n, Math.max(i1, i0 + 1)); i++) {
+        const o = occ[i] < 0 ? -occ[i] - 1 : occ[i];
+        if (occ[i] < 0) lost = true;
+        if (o > v) v = o;
+      }
+      if (v < 0) continue;
+      if (v > mx) mx = v;
+      const y = top + hh * (1 - v / 512);
+      g.fillStyle = lost ? "#ff5c6c" : "#4da3ff";
+      g.fillRect(x, y, 1, H - 4 - y);
+    }
+  }
+  $("#fifoNow").textContent = aud.level;
+  $("#fifoMax").textContent = n ? mx : "–";
+  // cuffie: ultimi 20 ms, agganciati al passaggio per lo zero in salita
+  const sc = $("#scopeCanvas"), s = sc.getContext("2d"), SW = sc.width, SH = sc.height;
+  s.clearRect(0, 0, SW, SH);
+  s.strokeStyle = "#2a323d"; s.beginPath(); s.moveTo(0, SH / 2); s.lineTo(SW, SH / 2); s.stroke();
+  const span = AUD_RATE * 0.02;
+  if (aud.filled > span * 3) {
+    const at = (k) => aud.pcm[(aud.w - k + AUD_KEEP * 2) % AUD_KEEP];
+    let start = span * 2;
+    for (let k = span * 2; k > span; k--) { if (at(k) <= 0 && at(k - 1) > 0) { start = k; break; } }
+    let peak = 0.05;
+    for (let k = start; k > start - span; k--) peak = Math.max(peak, Math.abs(at(k)));
+    s.strokeStyle = "#3ddc84"; s.beginPath();
+    for (let x = 0; x < span; x++) {
+      const y = SH / 2 - at(start - x) / peak * (SH / 2 - 6);
+      const px = x / span * SW;
+      x ? s.lineTo(px, y) : s.moveTo(px, y);
+    }
+    s.stroke();
+    const lbl = `picco ${(20 * Math.log10(peak)).toFixed(1).replace(".", ",")} dBFS`;
+    s.font = "10px monospace";
+    s.fillStyle = "rgba(11,15,20,.85)"; s.fillRect(3, 2, s.measureText(lbl).width + 8, 14);
+    s.fillStyle = "#8a96a5"; s.fillText(lbl, 7, 12);
+  }
+}
+function onCodec(r) {
+  const el = $("#codecState");
+  const defaults = [0x097, 0x097, 0x079, 0x079, 0x00A, 0x008, 0x09F, 0x00A, 0x000, 0x000];
+  if (defaults.every((v, i) => r[i] === v)) {
+    el.className = "audio-codec";
+    el.textContent = "Codec SSM2603 (I2C0 · 0x1A): registri ai valori di reset, non ancora configurato dal programma.";
+    return;
+  }
+  const db = (x) => (x > 0 ? "+" : "") + x.toFixed(1).replace(".", ",") + " dB";
+  const pd = r[6], active = r[9] & 1;
+  const inOn = !(pd & 0x81) && !(pd & 0x04) && !(r[4] & 0x04);
+  const outOn = !(pd & 0x80) && !(pd & 0x18) && (r[4] & 0x10) && !(r[5] & 0x08);
+  const lin = r[0], hp = r[2] & 0x7f;
+  const fmt = ["right-justified", "left-justified", "I2S", "DSP"][r[7] & 3], wl = [16, 20, 24, 32][(r[7] >> 2) & 3];
+  const parts = [
+    active ? "attivo" : "NON attivo (R9)",
+    inOn ? `line in ${lin & 0x80 ? "muto" : db(((lin & 0x3f) - 0x17) * 1.5)}` : "ingresso spento",
+    outOn ? `cuffie ${hp <= 0x2f ? "mute" : db(hp - 0x79)}` : "cuffie spente",
+    `${fmt}, ${wl} bit, codec ${r[7] & 0x40 ? "master" : "slave"}`,
+  ];
+  el.className = "audio-codec " + (active && inOn && outOn ? "on" : "bad");
+  el.textContent = "SSM2603: " + parts.join(" · ");
+}
+function listen() {
+  stopListen();
+  const secs = +$("#listenSecs").value;
+  const n = Math.min(aud.filled, secs * AUD_RATE);
+  if (n < AUD_RATE * 0.1) { termSys("── Nessun audio da ascoltare: avvia un programma che usa il codec. ──"); return; }
+  aud.ctx = aud.ctx || new (window.AudioContext || window.webkitAudioContext)();
+  const buf = aud.ctx.createBuffer(1, n, AUD_RATE);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = aud.pcm[(aud.w - n + i + AUD_KEEP) % AUD_KEEP];
+  aud.src = aud.ctx.createBufferSource();
+  aud.src.buffer = buf;
+  aud.src.connect(aud.ctx.destination);
+  aud.src.start();
+}
+function stopListen() { if (aud.src) { try { aud.src.stop(); } catch { } aud.src = null; } }
+$("#listenBtn").addEventListener("click", (e) => { if (e.target.tagName !== "SELECT") listen(); });
+$("#listenStop").addEventListener("click", stopListen);
+
+let ainTimer = null;
+function sendAudioIn() {
+  $("#ainLevelv").textContent = $("#ainLevel").value + " dBFS";
+  clearTimeout(ainTimer);
+  ainTimer = setTimeout(() => api("/api/audioin", { type: $("#ainType").value, freq: +$("#ainFreq").value, level: +$("#ainLevel").value }), 60);
+}
+["ainType", "ainFreq", "ainLevel"].forEach((id) => $("#" + id).addEventListener("input", sendAudioIn));
+$("#clockSel").addEventListener("change", () => api("/api/config", { clock: $("#clockSel").value }));
+(async () => {
+  try {
+    const s = await api("/api/status");
+    if (s.clock) $("#clockSel").value = s.clock;
+    if (s.audio) {
+      $("#ainType").value = s.audio.type; $("#ainFreq").value = s.audio.freq; $("#ainLevel").value = s.audio.level;
+      $("#ainLevelv").textContent = s.audio.level + " dBFS";
+    }
+  } catch { }
+})();
+showAudioCard(false);
+
+/* =====================================================================
    Eventi dall'emulatore
    ===================================================================== */
 function connect() {
@@ -605,7 +769,22 @@ function connect() {
         if (e.state === "booting") termSys("── Avvio dell'emulatore Renode (la prima volta richiede 15-40 s)… ──");
         if (e.state === "idle" && !booted) { booted = true; termSys("── Zybo Z7-10 emulata pronta. Scrivi o apri un programma e premi «Compila ed esegui». ──"); }
         if (e.state === "off" && e.reason) termSys("── " + e.reason + " ──");
+        if (e.state === "running" && e.clock) {
+          $("#clockNow").textContent = e.clock === "cpu" ? "tempo CPU" : "tempo reale";
+          $("#clockMeter").title = e.clock === "cpu"
+            ? "Tempo CPU: il tempo della scheda si calcola dalle istruzioni eseguite dal Cortex-A9 (667 MHz) e dagli accessi ai registri. Le durate misurate dal programma sono quelle della scheda."
+            : "Tempo reale: il tempo della scheda è quello del PC.";
+          if (e.wall && e.audio !== undefined) { audReset(); showAudioCard(!!e.audio); }
+          if (e.audio) {
+            termSys(e.clock === "cpu"
+              ? "── Programma con audio: orologio «tempo CPU». I tempi misurati sono quelli del Cortex-A9; l'emulazione è più lenta del reale. ──"
+              : "── Attenzione: programma con audio ma orologio «tempo reale». L'emulatore non regge 96 000 parole al secondo in tempo reale: scegli «tempo CPU» o «automatico». ──");
+          }
+        }
         break;
+      case "audio": onAudio(e); break;
+      case "audio_reset": audReset(); break;
+      case "codec": onCodec(e.regs); break;
       case "out": if (e.dev === "leds") setLeds(e.v); break;
       case "pin": if (e.dev === "ld4") $("#ld4").classList.toggle("on", !!e.v); break;
       case "in": setInputLevels(e.dev, e.v); break;

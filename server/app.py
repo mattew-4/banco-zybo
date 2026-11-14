@@ -50,6 +50,7 @@ class Hub:
         self.clients: list[queue.Queue] = []
         self.lock = threading.Lock()
         self.last_state = {"t": "state", "state": "off"}
+        self.last_codec: dict | None = None
         self.last_out: dict[str, dict] = {}
         self._pending_out: dict[str, dict] = {}
         self._uart_buf = bytearray()
@@ -64,6 +65,8 @@ class Hub:
         q.put(self.last_state)
         for e in self.last_out.values():
             q.put(e)
+        if self.last_codec:
+            q.put(self.last_codec)        # chi apre la pagina a programma avviato vede comunque lo stato del codec
         return q
 
     def unsubscribe(self, q):
@@ -87,6 +90,8 @@ class Hub:
             self.last_state = e
             if e.get("state") in ("running", "booting"):
                 self.last_out.clear()
+        if t == "codec":
+            self.last_codec = e
         if t in ("out", "pin"):
             key = e.get("dev", "") + str(e.get("n", ""))
             self.last_out[key] = e
@@ -125,6 +130,14 @@ HUB = Hub()
 EMU = emulator.Emulator(HUB.on_event, HUB.on_uart, HUB.on_log)
 BUILDS: dict[str, pathlib.Path] = {}
 SENSOR: dict = {"pitch": 0.0, "roll": 0.0, "temp": 28.5, "noise": 1.0, "whoami": 0x72, "mount": "jd"}
+# segnale su LINE IN (Lab 3): sinusoide a 1000 Hz, volume basso, come nel testo del lab
+AUDIO: dict = {"type": "sine", "freq": 1000.0, "level": -12.0}
+
+
+def run_elf(elf) -> bool:
+    """Programma la scheda: orologio scelto in config.json ("auto", "real" o "cpu")."""
+    cfg = load_config()
+    return EMU.run(elf, SENSOR, clock=cfg.get("clock", "auto"), audio=AUDIO, timing=cfg.get("timing"))
 
 
 def boot_async():
@@ -185,7 +198,9 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/events":
             return self._sse()
         if p == "/api/status":
-            return self._json({"state": EMU.state, "sensor": SENSOR, "labs_dir": load_config().get("labs_dir")})
+            cfg = load_config()
+            return self._json({"state": EMU.state, "sensor": SENSOR, "labs_dir": cfg.get("labs_dir"),
+                               "clock": cfg.get("clock", "auto"), "clock_now": EMU.clock, "audio": AUDIO})
         if p == "/api/labs":
             return self._list_labs()
         if p == "/api/labfile":
@@ -281,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
                 elf = BUILDS.get(d.get("id", ""))
                 if not elf:
                     return self._json({"error": "compila prima il programma"}, 400)
-                ok = EMU.run(elf, SENSOR)
+                ok = run_elf(elf)
                 return self._json({"ok": ok})
             if p == "/api/upload-elf":
                 return self._upload_elf()
@@ -294,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif a == "stop":
                     EMU.halt()
                 elif a == "reset" and EMU.elf:
-                    EMU.run(EMU.elf, SENSOR)
+                    run_elf(EMU.elf)
                 elif a == "reboot":
                     EMU.shutdown()
                     boot_async()
@@ -325,6 +340,17 @@ class Handler(BaseHTTPRequestHandler):
                 if EMU.state in ("running", "paused", "idle"):
                     EMU.set_sensor(send)
                 return self._json({"ok": True, "sensor": SENSOR})
+            if p == "/api/audioin":
+                d = self._body_json()
+                if d.get("type") in ("sine", "square", "sweep", "noise", "silence"):
+                    AUDIO["type"] = d["type"]
+                if "freq" in d:
+                    AUDIO["freq"] = min(23000.0, max(20.0, float(d["freq"])))
+                if "level" in d:
+                    AUDIO["level"] = min(0.0, max(-90.0, float(d["level"])))
+                if EMU.state in ("running", "paused", "idle"):
+                    EMU.set_audio_input(AUDIO)
+                return self._json({"ok": True, "audio": AUDIO})
             if p == "/api/uart":
                 text = self._body_json().get("text", "")
                 EMU.uart_write(text.encode("utf-8"))
@@ -340,6 +366,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not p.is_dir():
                         return self._json({"error": f"Cartella non trovata: {p}"}, 400)
                     cfg["labs_dir"] = str(p.resolve())
+                if d.get("clock") in ("auto", "real", "cpu"):
+                    cfg["clock"] = d["clock"]
                 CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
                 return self._json({"ok": True})
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -362,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
                 BUILDS.pop(old, None)
         started = False
         if run and res.ok and res.elf:
-            started = EMU.run(res.elf, SENSOR)
+            started = run_elf(res.elf)
         return self._json({"ok": res.ok, "id": bid if res.ok else None, "log": res.log, "size": res.size,
                            "seconds": round(res.seconds, 2), "commands": res.commands, "started": started})
 
@@ -381,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
         BUILDS[bid] = elf
         warn = "" if 0x00100000 <= entry < 0x40000000 else (
             f"Attenzione: entry point 0x{entry:08X} fuori dalla DDR (atteso 0x00100000).")
-        started = EMU.run(elf, SENSOR)
+        started = run_elf(elf)
         return self._json({"ok": True, "id": bid, "entry": f"0x{entry:08X}", "warning": warn, "started": started})
 
 
