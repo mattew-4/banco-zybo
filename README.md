@@ -118,7 +118,10 @@ del Lab 3 gira senza modifiche:
 
 Quando il programma usa l'audio compare il pannello **Audio · Lab 3**, con queste parti:
 - **LINE IN**: il generatore di segnale che sostituisce il telefono (sinusoide, onda quadra, sweep,
-  rumore, silenzio), regolabile anche mentre il programma gira;
+  rumore, silenzio), regolabile anche mentre il programma gira, oppure **audio reale**: un file
+  (WAV, MP3, OGG… decodificato dal browser) o qualche secondo registrato dal **microfono** del PC.
+  L'audio reale viene riprodotto in ciclo, ricampionato alla frequenza del codec; il cursore diventa
+  un guadagno (0 dB = come il file). Dalla riga di comando: `--input "file brano.wav"`;
 - lo **stato del codec**, letto dai registri che il programma ha scritto;
 - l'**occupazione della FIFO RX** negli ultimi 0,5 s: in rosso i tratti in cui la FIFO era piena e
   le parole si perdevano;
@@ -142,7 +145,8 @@ Il modello ha tre parametri. I valori predefiniti riproducono quanto descritto n
 
 Se misuri valori diversi sulla scheda, puoi cambiarli in `config.json`, nella cartella del banco:
 ```json
-{ "timing": { "cpi": 1.51, "pl_read_ns": 1000, "pl_write_ns": 700 } }
+{ "timing": { "cpi": 1.51, "pl_read_ns": 1000, "pl_write_ns": 700,
+              "cpi_cache": 1.40, "l2_hit_cycles": 25, "ddr_cycles": 60, "cache": 2 } }
 ```
 
 Il BSP del banco ha le stesse definizioni (`xparameters.h`) del BSP generato per il bitstream del
@@ -150,10 +154,36 @@ corso, compreso il driver Xilinx `XLlFifo` per le FIFO. Della PL del corso non s
 seconda AXI4-Stream FIFO (`0x43C2_0000`) e gli interrupt delle FIFO (ID 63 e 64): i loro accessi
 vengono segnalati in giallo.
 
-**Limiti del modello:** le cache e la pipeline non sono modellate. Per questo `-O1` e `-O2` danno
-tempi quasi uguali e misure ripetute danno sempre lo stesso valore, mentre sulla scheda `max` supera
-di poco `avg`. Le soglie (quale N perde campioni, il lavoro più lungo che la FIFO assorbe) sono
-quelle del modello: **verificale sulla scheda**.
+**Limiti del modello:** la pipeline non è modellata e, per i programmi del Lab 3, nemmeno le cache
+(vedi sotto). Per questo `-O1` e `-O2` danno tempi quasi uguali e misure ripetute danno sempre lo
+stesso valore, mentre sulla scheda `max` supera di poco `avg`. Le soglie (quale N perde campioni, il
+lavoro più lungo che la FIFO assorbe) sono quelle del modello: **verificale sulla scheda**.
+
+### Cache e contatori di prestazioni (PMU)
+
+Per i programmi che **misurano le prestazioni**, cioè leggono i contatori del PMU (`mrc p15, 0, rX,
+c9, c13, …`) o usano le funzioni `Xil_DCache*`, `Xil_L1DCache*`, `Xil_L2Cache*`, `Xpm_*`, il banco
+usa il tempo CPU e attiva un modello delle cache dati:
+- **L1D** del Cortex-A9: 32 KB, 4 vie, righe da 32 byte, write-back, sostituzione pseudo-casuale; si
+  spegne e si riaccende con `SCTLR.C` (`Xil_DCacheDisable`/`Xil_DCacheEnable`);
+- **L2 PL310**: 512 KB, 8 vie, con il prefetch della riga successiva abilitato dal BSP;
+  manutenzione (`Xil_DCacheFlush*`, `…Invalidate*`) e contatori di eventi del PL310 (DRREQ, DRHIT,
+  DWREQ, DWHIT, CO);
+- un miss costa cicli in più: +25 se la riga è in L2, +60 se va presa dalla DDR (`l2_hit_cycles`,
+  `ddr_cycles` in `config.json`); con la D-cache spenta ogni lettura va in DDR;
+- **PMU**: `PMCCNTR` conta i cicli del tempo CPU (667 MHz: il doppio dei tick di `XTime`), compresi
+  miss e attese sui registri, con il divisore per 64 di `PMCR.D`; gli eventi `0x03` (refill L1D) e
+  `0x04` (accesso L1D) sono contati dal modello.
+
+Con il modello attivo il CPI medio è più basso (`cpi_cache`: 1,40), perché parte del tempo è nei
+miss: l'FFT N = 512 a `-O2` dura sempre 157 µs, ma ora `max` supera `avg` e a N = 4096 i dati
+escono dalla L1 (circa 2100 µs). La prova `tests/cache_pmu.c` mostra la gerarchia: 12 ns per
+accesso in L1, 50 in L2, 77 oltre la L2, 138 con la cache spenta.
+
+Il modello rende l'emulazione circa **5 volte più lenta**, per questo non è attivo per gli altri
+programmi. In `config.json` si può forzare: `"cache": 1` sempre, `0` mai, `2` automatico
+(predefinito). Non sono modellati la cache istruzioni, il prefetcher della L1 e la manutenzione della
+sola L1 via CP15 (il banco non la vede).
 
 ---
 
@@ -197,7 +227,7 @@ Il banco non «aggiusta» gli errori: la scheda emulata sbaglia come quella vera
 
 | Errore nel programma | Cosa succede (sulla scheda e nel banco) |
 |---|---|
-| Accesso a un indirizzo della PL dove non c'è nessun blocco | DECERR → Data Abort → il gestore del BSP si ferma in un ciclo infinito: **il programma si blocca** su quell'istruzione (il banco lo indica in rosso) |
+| Accesso a un indirizzo della PL dove non c'è nessun blocco | DECERR → **Data Abort** vero: il processore entra nel gestore. Lettura: abort preciso (`DFSR` = 0x008, `DFAR` = indirizzo, `DataAbortAddr` = l'istruzione). Scrittura: abort impreciso, qualche istruzione dopo (`DFSR` = 0x406). Se il programma non ha registrato un suo gestore, quello del BSP si ferma in un ciclo infinito: **il programma si blocca** (il banco lo indica in rosso) |
 | Elaborazione troppo lenta, `usleep` o stampe lunghe nel ciclo audio | la FIFO RX si riempie, le parole si perdono, si sentono clic; dopo un numero dispari di parole perse sinistro e destro si scambiano |
 | I2S non abilitato, o `TDFD` scritto senza chiudere il pacchetto con `TLR` | il programma resta bloccato in attesa in `read_sample`/`write_sample` |
 | `TLR` diverso dai byte scritti | errore TSE nel registro di stato della FIFO |
@@ -210,10 +240,9 @@ Il banco non «aggiusta» gli errori: la scheda emulata sbaglia come quella vera
 | Variabile locale non inizializzata | contiene residui della memoria (la DDR non è azzerata), non 0 |
 | Programma che finisce con `while (1);` | la UART finisce comunque di trasmettere ciò che ha nella FIFO |
 
-**Cosa il banco non riproduce:** le cache (tempi un po' più regolari e, a N grandi, più bassi
-della scheda), la seconda FIFO del design e gli interrupt delle FIFO (segnalati quando il programma
-li usa), e un gestore di Data Abort scritto dal programma (il banco ferma la CPU come il gestore
-predefinito del BSP).
+**Cosa il banco non riproduce:** le cache per i programmi che non misurano le prestazioni (tempi
+un po' più regolari e, a N grandi, più bassi della scheda), la seconda FIFO del design e gli
+interrupt delle FIFO (segnalati quando il programma li usa).
 
 **Il banco serve per provare e capire il codice. I risultati da consegnare, soprattutto le misure
 di tempo, vanno verificati sulla scheda vera.**

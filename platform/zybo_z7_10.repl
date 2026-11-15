@@ -27,7 +27,7 @@ scu: Miscellaneous.ArmSnoopControlUnit @ sysbus 0xF8F00000
 pmu: Miscellaneous.ArmPerformanceMonitoringUnit @ cpu
     -> gic@5
 
-pl310: Cache.PL310 @ sysbus <0xF8F02000, +0x1000>
+pl310: Zybo.Pl310 @ sysbus <0xF8F02000, +0x1000>
 
 // Timer del Cortex-A9 MPCore, PERIPHCLK = CPU/2 = 333.33 MHz, in tempo reale
 globalTimer: Zybo.A9GlobalTimer @ sysbus 0xF8F00200

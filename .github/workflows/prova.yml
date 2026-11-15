@@ -80,10 +80,30 @@ jobs:
           python -I server/selftest.py tests/codec_inactive.c 30 --input "sine 1000 -12" \
             --expect "picco con codec non attivo: zero" >> wrong.log 2>&1
           rc2=$?
+          python -I server/selftest.py tests/data_abort_handler.c 6 \
+            --expect "gestore: DFSR 0x008 DFAR 0x43C30000 istruzione giusta" --expect-not "dopo l'accesso" >> wrong.log 2>&1
+          rc3=$?
           cat wrong.log
-          if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+          if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ] || [ $rc3 -ne 0 ]; then
             msg=$(tail -n 60 wrong.log | cut -c1-200 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=sbagliati::${msg}"
+            exit 1
+          fi
+
+      - name: Cache, PMU e audio reale (WAV su LINE IN)
+        shell: bash
+        run: |
+          set +e
+          python -I tests/make_tone_wav.py tone.wav
+          python -I server/selftest.py examples/audio_passthrough.c 20 --input "file tone.wav" \
+            --expect "picco -6 dBFS  FIFO piena 0 volte" > perf.log 2>&1
+          rc1=$?
+          python -I server/selftest.py tests/cache_pmu.c 90 --expect "VERIFICA CACHE OK" >> perf.log 2>&1
+          rc2=$?
+          cat perf.log
+          if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+            msg=$(tail -n 60 perf.log | cut -c1-200 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=cache-wav::${msg}"
             exit 1
           fi
 

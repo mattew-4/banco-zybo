@@ -31,6 +31,10 @@ expect_abort = "--expect-abort" in sys.argv
 if expect_abort:
     sys.argv.remove("--expect-abort")
 clock = _opt("--clock", "auto")          # auto | real | cpu
+timing = {}                              # --timing chiave=valore (taratura, es. cpi=1.4 cache=0)
+while "--timing" in sys.argv:
+    k, _, v = _opt("--timing").partition("=")
+    timing[k] = float(v)
 audio_in = _opt("--input")               # es. "sine 1000 -12"
 
 opt = _opt("--opt")
@@ -129,11 +133,22 @@ t_start = time.time()
 ok = emu.boot()
 print("== BOOT Renode ok=%s in %.1fs" % (ok, time.time() - t_start))
 ain = None
-if audio_in:
+if audio_in and audio_in.startswith("file "):
+    # audio reale da un WAV: "file percorso.wav [guadagno dB]"
+    from zyboemu import audiofile
+    parts = audio_in[5:].strip().rsplit(" ", 1)
+    wav, gain = (parts[0], float(parts[1])) if len(parts) == 2 and parts[1].lstrip("-").replace(".", "").isdigit() \
+        else (audio_in[5:].strip(), 0.0)
+    info = audiofile.wav_to_raw(pathlib.Path(wav).read_bytes(), work / "audio_in.raw")
+    info["path"] = str(work / "audio_in.raw")
+    print("== INGRESSO: file %s, %d Hz, %d canali, %.2f s" % (wav, info["rate"], info["channels"], info["seconds"]))
+    ain = {"type": "file", "freq": 1000, "level": gain, "file": info}
+elif audio_in:
     k, f, lv = (audio_in.split() + ["1000", "-12"])[:3]
     ain = {"type": k, "freq": float(f), "level": float(lv)}
-ok = emu.run(res.elf, clock=clock, audio=ain)
-print("== OROLOGIO:", emu.clock, "| percorso audio nel programma:", emulator.uses_audio(res.elf))
+ok = emu.run(res.elf, clock=clock, audio=ain, timing=timing)
+print("== OROLOGIO:", emu.clock, "| percorso audio nel programma:", emulator.uses_audio(res.elf),
+      "| modello delle cache:", emu.cache_model)
 t0 = time.time()
 plan = []
 for a in filter(None, actions.split(";")):

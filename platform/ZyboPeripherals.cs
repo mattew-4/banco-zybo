@@ -213,6 +213,28 @@ namespace Antmicro.Renode.Peripherals.Zybo
             lock(sync)
             {
                 extra += seconds;
+                AddPmu(seconds);
+            }
+        }
+
+        // tempo aggiunto a quello delle istruzioni: va anche nel contatore di cicli del PMU,
+        // che il modello delle cache aggiorna dal thread della CPU (CacheModel.FlushPmu)
+        private static void AddPmu(double seconds)
+        {
+            pmuPending += seconds;
+            PmuDirty = true;
+        }
+
+        public static volatile bool PmuDirty;
+
+        public static double TakePmuSeconds()
+        {
+            lock(sync)
+            {
+                var s = pmuPending;
+                pmuPending = 0;
+                PmuDirty = false;
+                return s;
             }
         }
 
@@ -223,7 +245,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
             lock(sync)
             {
                 var now = NowLocked();
-                if(t > now) { extra += t - now; }
+                if(t > now) { extra += t - now; AddPmu(t - now); }
             }
         }
 
@@ -237,6 +259,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
                 last = seconds;
                 lastInstr = instrBase;
                 lastRenode = RenodeSeconds;
+                cacheBase = CacheModel.TotalCycles;
+                pmuPending = 0;
             }
         }
 
@@ -248,10 +272,12 @@ namespace Antmicro.Renode.Peripherals.Zybo
             // al passo del tempo virtuale di Renode. Senza questo, un programma che finisce con
             // "while (1);" fermerebbe anche UART e flusso audio, cosa che sulla scheda non succede.
             double rv = RenodeSeconds;
-            if(i == lastInstr && rv > lastRenode) { extra += rv - lastRenode; }
+            if(i == lastInstr && rv > lastRenode) { extra += rv - lastRenode; AddPmu(rv - lastRenode); }
             lastInstr = i;
             lastRenode = rv;
-            double t = baseSeconds + (i - instrBase) * CyclesPerInstruction / CpuHz + extra;
+            long cc = CacheModel.TotalCycles;
+            if(cc < cacheBase) { cacheBase = cc; }
+            double t = baseSeconds + ((i - instrBase) * CyclesPerInstruction + (cc - cacheBase)) / CpuHz + extra;
             if(t < last) { t = last; }
             last = t;
             return t;
@@ -261,7 +287,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static ICPU cpu;
         private static IMachine machine;
         private static ulong instrBase, lastInstr;
-        private static double lastRenode;
+        private static double lastRenode, pmuPending;
+        private static long cacheBase;
         private static double baseSeconds, extra, last;
     }
 
@@ -272,6 +299,414 @@ namespace Antmicro.Renode.Peripherals.Zybo
     {
         public static double SclHz = 100000;
         public static double Of(int dataBytes) { return (dataBytes + 1) * 9 / SclHz; }
+    }
+
+    // ------------------------------------------------------------------
+    // Cache dati del Cortex-A9 (L1D, TRM r3p0 cap. 7) e cache L2 PL310 (TRM r3p2), solo per il
+    // tempo CPU: ogni lettura/scrittura in DDR od OCM passa per il modello e un miss costa cicli
+    // in piu' rispetto al CPI medio. Il PMU riceve gli stessi cicli (PMCCNTR = tempo CPU x 667 MHz)
+    // e, se un contatore li ascolta, gli eventi 0x03 (refill L1D) e 0x04 (accesso L1D).
+    //  - L1D: 32 KB, 4 vie, righe da 32 B, write-back write-allocate, sostituzione pseudo-casuale
+    //    (SCTLR.RR = 0, come dopo il boot del BSP); attiva se SCTLR.C = 1.
+    //  - L2: 512 KB, 8 vie, righe da 32 B, sostituzione pseudo-casuale; attiva se il registro di
+    //    controllo del PL310 ha il bit 0; prefetch della riga successiva se AUX[28] (il BSP lo abilita).
+    //  - Con SCTLR.C = 0 ogni accesso ai dati e' non-cacheable: va in DDR, scavalcando anche la L2.
+    // Non modellati: cache istruzioni, prefetcher della L1, miss multipli sovrapposti; le operazioni
+    // di manutenzione della L1 via CP15 (invisibili al banco), mentre quelle del PL310 si'.
+    // ------------------------------------------------------------------
+    public static class CacheModel
+    {
+        public static int L2HitCycles = 25;          // miss L1 servito dalla L2
+        public static int DdrCycles = 60;            // in piu' se la riga manca anche nella L2
+        public static int UncachedWriteCycles = 8;   // scrittura non-cacheable: entra nel buffer di scrittura
+        public static int WriteBackCycles = 4;       // riga sporca espulsa (buffer di espulsione)
+
+        public static bool Active { get; private set; }
+        public static long TotalCycles { get { return Interlocked.Read(ref totalCycles); } }
+
+        // ---- stato del PL310 (scritto dal modello del registro) ----
+        public static bool L2Enabled;
+        public static uint L2Aux = 0x02060000;
+        public static readonly long[] L2Events = new long[16];   // per sorgente di evento del PL310
+
+        public static void Install(IMachine machine, bool on)
+        {
+            TranslationCPU tcpu = null;
+            foreach(var c in machine.SystemBus.GetCPUs()) { tcpu = c as TranslationCPU; break; }
+            if(tcpu == null) { return; }
+            cpu = tcpu;
+            arm = tcpu as Arm;
+            InvalidateL1();
+            InvalidateL2();
+            Array.Clear(L2Events, 0, L2Events.Length);
+            pmuCycles = 0;
+            evAccess = evRefill = 0;
+            poll = pollRound = 0;
+            ccntOn = false;
+            ccntDiv = 1;
+            pending = 0;
+            Active = on;
+            // PMCCNTR: cicli = istruzioni x CPI (tlib) + cicli aggiunti qui (miss, bus, attese)
+            baseMilli = curMilli = on ? (long)Math.Round(CpuClock.CyclesPerInstruction * 1000) : 1000;
+            debtMilli = 0;
+            instrPerFlush = 0;
+            lastCcnt = 0;
+            try { lastPayInstr = tcpu.ExecutedInstructions; } catch(Exception) { lastPayInstr = 0; }
+            try { tcpu.CyclesPerInstruction = baseMilli / 1000m; } catch(Exception) { }
+            tcpu.SetHookAtMemoryAccess(on ? (MemoryAccessHook)OnAccess : null);
+            if(on) { Poll(); }
+        }
+
+        public static void SyncCyclesPerInstruction()
+        {
+            if(Active && cpu != null)
+            {
+                baseMilli = curMilli = (long)Math.Round(CpuClock.CyclesPerInstruction * 1000);
+                debtMilli = 0;
+                try { cpu.CyclesPerInstruction = baseMilli / 1000m; } catch(Exception) { }
+            }
+        }
+
+        private static void OnAccess(ulong pc, Antmicro.Renode.Logging.Profiling.MemoryOperation op, ulong va, ulong pa, uint width, ulong value)
+        {
+            bool write = op == Antmicro.Renode.Logging.Profiling.MemoryOperation.MemoryWrite;
+            if(write || op == Antmicro.Renode.Logging.Profiling.MemoryOperation.MemoryRead)
+            {
+                if(pa < 0x40000000UL || pa >= 0xFFFC0000UL) { Data(pa, write); }
+            }
+            if(--poll <= 0) { Poll(); }
+            if(pending > 0 || CpuClock.PmuDirty || curMilli != baseMilli) { FlushPmu(); }
+        }
+
+        // ---- un accesso ai dati ----
+        private static void Data(ulong pa, bool write)
+        {
+            if(watchAccess) { evAccess++; }
+            if(!l1On)
+            {
+                Add(write ? UncachedWriteCycles : L2HitCycles + DdrCycles);
+                return;
+            }
+            uint line = (uint)(pa >> 5) + 1;                 // 0 = via vuota
+            int b = (int)((pa >> 5) & 255) * 4;
+            for(int w = 0; w < 4; w++)
+            {
+                if(l1[b + w] == line)
+                {
+                    if(write) { l1Dirty[b + w] = true; }
+                    return;                                  // hit: costo gia' nel CPI
+                }
+            }
+            if(watchRefill) { evRefill++; }
+            int v = b + Victim(l1, b, 4);
+            long c = 0;
+            if(l1[v] != 0 && l1Dirty[v]) { c += WriteBack(l1[v] - 1); }
+            c += Fill(line - 1);
+            l1[v] = line;
+            l1Dirty[v] = write;
+            Add(write ? c / 2 : c);                          // il buffer di scrittura nasconde parte dell'attesa
+        }
+
+        // la riga sporca espulsa dalla L1 va nella L2 (richiesta di scrittura)
+        private static long WriteBack(uint lineAddr)
+        {
+            if(!L2Enabled) { return WriteBackCycles; }
+            L2Events[5]++;                                   // DWREQ
+            int w = L2Find(lineAddr);
+            if(w >= 0) { L2Events[4]++; l2Dirty[w] = true; return WriteBackCycles; }   // DWHIT
+            L2Insert(lineAddr, true);
+            return WriteBackCycles;
+        }
+
+        // riempimento di una riga della L1: dalla L2 o dalla DDR
+        private static long Fill(uint lineAddr)
+        {
+            if(!L2Enabled) { return L2HitCycles + DdrCycles; }
+            L2Events[3]++;                                   // DRREQ
+            long c = L2HitCycles;
+            int w = L2Find(lineAddr);
+            if(w >= 0)
+            {
+                L2Events[2]++;                               // DRHIT
+                if(l2Pf[w])
+                {
+                    // riga portata dal prefetch: la lettura dalla DDR era partita da poco,
+                    // l'attesa e' solo in parte nascosta (la banda della DDR resta il limite)
+                    c += DdrCycles / 3;
+                    l2Pf[w] = false;
+                }
+            }
+            else
+            {
+                c += DdrCycles;
+                L2Insert(lineAddr, false);
+            }
+            if((L2Aux & (1u << 28)) != 0 && L2Find(lineAddr + 1) < 0)
+            {
+                l2Pf[L2Insert(lineAddr + 1, false)] = true;  // prefetch della riga successiva
+                L2Events[0xA]++;                             // IPFALLOC (allocazione da prefetch)
+            }
+            return c;
+        }
+
+        private static int L2Find(uint lineAddr)
+        {
+            uint tag = lineAddr + 1;
+            int b = (int)(lineAddr & 2047) * 8;
+            for(int w = 0; w < 8; w++) { if(l2[b + w] == tag) { return b + w; } }
+            return -1;
+        }
+
+        private static int L2Insert(uint lineAddr, bool dirty)
+        {
+            int b = (int)(lineAddr & 2047) * 8;
+            int v = b + Victim(l2, b, 8);
+            if(l2[v] != 0 && l2Dirty[v]) { L2Events[1]++; }  // CO: riga sporca scritta in DDR
+            l2[v] = lineAddr + 1;
+            l2Dirty[v] = dirty;
+            l2Pf[v] = false;
+            return v;
+        }
+
+        private static int Victim(uint[] ways, int b, int n)
+        {
+            for(int w = 0; w < n; w++) { if(ways[b + w] == 0) { return w; } }
+            lfsr = (lfsr >> 1) ^ (uint)(-(int)(lfsr & 1) & 0xB400u);   // LFSR a 16 bit
+            return (int)(lfsr % (uint)n);
+        }
+
+        private static void Add(long c)
+        {
+            if(c <= 0) { return; }
+            Interlocked.Add(ref totalCycles, c);
+            pending += c;
+        }
+
+        // ---- operazioni di manutenzione del PL310 (Xil_DCacheFlush, ...Range, ...Invalidate) ----
+        // Xil_DCacheFlush/Invalidate puliscono anche la L1 via CP15 subito prima: il banco non vede
+        // quelle istruzioni, quindi tratta la L1 insieme alla L2.
+        public static void MaintainAll(bool invalidate)
+        {
+            if(invalidate) { InvalidateL1(); InvalidateL2(); return; }
+            Array.Clear(l1Dirty, 0, l1Dirty.Length);
+            Array.Clear(l2Dirty, 0, l2Dirty.Length);
+        }
+
+        public static void MaintainLine(ulong pa, bool invalidate)
+        {
+            uint lineAddr = (uint)(pa >> 5);
+            int b = (int)(lineAddr & 255) * 4;
+            for(int w = 0; w < 4; w++)
+            {
+                if(l1[b + w] == lineAddr + 1) { l1Dirty[b + w] = false; if(invalidate) { l1[b + w] = 0; } }
+            }
+            int x = L2Find(lineAddr);
+            if(x >= 0) { l2Dirty[x] = false; if(invalidate) { l2[x] = 0; } }
+        }
+
+        private static void InvalidateL1() { Array.Clear(l1, 0, l1.Length); Array.Clear(l1Dirty, 0, l1Dirty.Length); }
+        private static void InvalidateL2() { Array.Clear(l2, 0, l2.Length); Array.Clear(l2Dirty, 0, l2Dirty.Length); Array.Clear(l2Pf, 0, l2Pf.Length); }
+
+        // ---- ogni 2048 accessi: stato di SCTLR.C ed eventi seguiti dai contatori del PMU ----
+        // Si leggono i registri di sistema direttamente (siamo nel thread della CPU): i metodi
+        // del PMU di Renode mettono in pausa la macchina e, chiamati da qui, si bloccherebbero.
+        private static void Poll()
+        {
+            poll = 64;
+            if(arm == null) { return; }
+            try
+            {
+                bool on = (arm.GetSystemRegisterValue("SCTLR") & 4) != 0;
+                if(on != l1On)
+                {
+                    InvalidateL1();          // Xil_DCacheEnable invalida prima di abilitare; Disable pulisce
+                    l1On = on;
+                }
+                if(ccntOn)
+                {
+                    // PMCCNTR tornato indietro: il programma l'ha azzerato (PMCR.C), il debito non vale piu'
+                    ulong cc = arm.GetSystemRegisterValue("PMCCNTR");
+                    if(cc < lastCcnt) { debtMilli = 0; }
+                    lastCcnt = cc;
+                }
+                int round = pollRound++;
+                if((round & 3) != 0) { return; }                 // PMU ogni 256 accessi
+                ulong pmcr = arm.GetSystemRegisterValue("PMCR");
+                ccntOn = (pmcr & 1) != 0 && (arm.GetSystemRegisterValue("PMCNTENSET") & 0x80000000UL) != 0;
+                if((round & 31) != 0) { return; }                // eventi seguiti ogni 2048 accessi
+                watchAccess = watchRefill = false;
+                if((pmcr & 1) != 0)
+                {
+                    ulong sel = arm.GetSystemRegisterValue("PMSELR");
+                    for(uint i = 0; i < 6; i++)
+                    {
+                        arm.SetSystemRegisterValue("PMSELR", i);
+                        ulong e = arm.GetSystemRegisterValue("PMXEVTYPER") & 0xFF;
+                        if(e == 0x04) { watchAccess = true; }
+                        if(e == 0x03) { watchRefill = true; }
+                    }
+                    arm.SetSystemRegisterValue("PMSELR", sel);
+                }
+            }
+            catch(Exception)
+            {
+            }
+        }
+
+        // cicli ed eventi al PMU, sempre dal thread della CPU.
+        //  - PMCCNTR: in tlib e' in sola lettura e vale la somma di (istruzioni x CPI) intervallo per
+        //    intervallo (ogni cambio di CPI chiude il conto). I cicli in piu' (miss, bus, attese) sono un
+        //    "debito" che si paga alzando il CPI di tlib per le istruzioni successive: a ogni passaggio
+        //    si misura quanto e' stato pagato e si corregge (anche sotto la base, se si e' pagato troppo).
+        //    Il ritardo e' di poche istruzioni; il tempo della scheda (CpuClock) non dipende da questo.
+        //  - eventi 0x03/0x04: tlib li somma ai contatori abilitati che li seguono.
+        public static void FlushPmu()
+        {
+            if(!Active) { return; }
+            pmuCycles += CpuClock.TakePmuSeconds() * CpuClock.CpuHz + pending;
+            pending = 0;
+            if(arm == null) { pmuCycles = 0; evAccess = evRefill = 0; return; }
+            try
+            {
+                if(!ccntOn) { pmuCycles = 0; debtMilli = 0; }   // contatore fermo: quei cicli non contano
+                if(pmuCycles >= 1 || debtMilli != 0 || curMilli != baseMilli)
+                {
+                    ulong now = cpu.ExecutedInstructions;
+                    long dI = (long)(now - lastPayInstr);
+                    lastPayInstr = now;
+                    if(dI < 0) { dI = 0; }
+                    debtMilli -= dI * (curMilli - baseMilli);      // gia' pagato (o pagato in piu')
+                    // pagato troppo durante un tratto lungo senza accessi alla memoria (es. i cicli CP15
+                    // di Xil_DCacheFlush): oltre 64 istruzioni si condona, per non fermare il contatore
+                    if(debtMilli < -baseMilli * 64) { debtMilli = -baseMilli * 64; }
+                    long whole = (long)pmuCycles;
+                    debtMilli += whole * 1000;
+                    pmuCycles -= whole;
+                    // tlib aggiorna il conteggio delle istruzioni a blocchi: si stima quante istruzioni
+                    // passano in media tra due controlli e si spalma il debito su almeno quelle
+                    instrPerFlush += (dI - instrPerFlush) / 16.0;
+                    double spread = Math.Max(PayInstructions, instrPerFlush * 2);
+                    long target = baseMilli + (long)(debtMilli / spread);
+                    if(target < 1) { target = 1; }
+                    if(target > 4000000000L) { target = 4000000000L; }
+                    if(target != curMilli)
+                    {
+                        cpu.CyclesPerInstruction = target / 1000m;
+                        curMilli = target;
+                    }
+                }
+                if(arm.TlibUpdatePmuCounters != null)
+                {
+                    if(evAccess > 0) { arm.TlibUpdatePmuCounters(0x04, (uint)evAccess); }
+                    if(evRefill > 0) { arm.TlibUpdatePmuCounters(0x03, (uint)evRefill); }
+                }
+            }
+            catch(Exception)
+            {
+                pmuCycles = 0;
+            }
+            evAccess = evRefill = 0;
+        }
+
+        private static TranslationCPU cpu;
+        private static Arm arm;
+        private static readonly uint[] l1 = new uint[256 * 4], l2 = new uint[2048 * 8];
+        private static readonly bool[] l1Dirty = new bool[256 * 4], l2Dirty = new bool[2048 * 8], l2Pf = new bool[2048 * 8];
+        private static bool l1On, watchAccess, watchRefill, ccntOn;
+        private static int poll, pollRound, ccntDiv = 1;
+        private const long PayInstructions = 8;          // il debito si paga in circa 8 istruzioni
+        private static long baseMilli = 1000, curMilli = 1000, debtMilli;
+        private static ulong lastPayInstr, lastCcnt;
+        private static double instrPerFlush;
+        private static uint lfsr = 0xACE1u;
+        private static long totalCycles, pending, evAccess, evRefill;
+        private static double pmuCycles;
+    }
+
+    // Controllore della cache L2 PL310 (0xF8F02000): abilitazione, manutenzione, contatori di eventi
+    public class Pl310 : IDoubleWordPeripheral, IKnownSize
+    {
+        public Pl310(IMachine machine) { Reset(); }
+
+        public long Size { get { return 0x1000; } }
+
+        public void Reset()
+        {
+            regs.Clear();
+            CacheModel.L2Enabled = false;
+            CacheModel.L2Aux = 0x02060000;
+            evCtrl = 0;
+            cnt0 = cnt1 = cfg0 = cfg1 = 0;
+            base0 = base1 = new long[16];
+        }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            ZyboBus.Access(CpuClock.PrivateSeconds);
+            switch(offset)
+            {
+            case 0x000: return 0x410000C8;                    // CACHE_ID: ARM, PL310 r3p2
+            case 0x004: return 0x9E440E;                      // CACHE_TYPE: 8 vie, 64 KB per via, righe da 32 B
+            case 0x100: return CacheModel.L2Enabled ? 1u : 0u;
+            case 0x104: return CacheModel.L2Aux;
+            case 0x200: return evCtrl;
+            case 0x204: return cfg1;
+            case 0x208: return cfg0;
+            case 0x20C: return Counter(cfg1, base1, cnt1);
+            case 0x210: return Counter(cfg0, base0, cnt0);
+            case 0x730: case 0x770: case 0x77C: case 0x7B0: case 0x7BC: case 0x7F0: case 0x7FC:
+                return 0;                                     // operazione gia' completata
+            }
+            uint v;
+            return regs.TryGetValue(offset, out v) ? v : 0;
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            ZyboBus.Access(CpuClock.PrivateSeconds);
+            switch(offset)
+            {
+            case 0x100: CacheModel.L2Enabled = (value & 1) != 0; return;
+            case 0x104: if(!CacheModel.L2Enabled) { CacheModel.L2Aux = value; } return;   // scrivibile solo a L2 spenta
+            case 0x200:
+                if((evCtrl & 1) != 0 && (value & 1) == 0)
+                {
+                    cnt0 = Counter(cfg0, base0, cnt0);       // disabilitati: i contatori si fermano
+                    cnt1 = Counter(cfg1, base1, cnt1);
+                }
+                else if((evCtrl & 1) == 0 && (value & 1) != 0)
+                {
+                    base0 = base1 = Snapshot();              // abilitati: contano da adesso
+                }
+                evCtrl = value & 1;
+                if((value & 2) != 0) { cnt0 = 0; base0 = Snapshot(); }
+                if((value & 4) != 0) { cnt1 = 0; base1 = Snapshot(); }
+                return;
+            case 0x204: cnt1 = Counter(cfg1, base1, cnt1); cfg1 = value; base1 = Snapshot(); return;
+            case 0x208: cnt0 = Counter(cfg0, base0, cnt0); cfg0 = value; base0 = Snapshot(); return;
+            case 0x20C: cnt1 = value; base1 = Snapshot(); return;
+            case 0x210: cnt0 = value; base0 = Snapshot(); return;
+            case 0x77C: case 0x7FC: if((value & 0xFF) != 0) { CacheModel.MaintainAll(true); } return;
+            case 0x7BC: if((value & 0xFF) != 0) { CacheModel.MaintainAll(false); } return;
+            case 0x770: case 0x7F0: CacheModel.MaintainLine(value, true); return;
+            case 0x7B0: CacheModel.MaintainLine(value, false); return;
+            }
+            regs[offset] = value;
+        }
+
+        // valore di un contatore: eventi della sorgente scelta (CFG[5:2]) dall'ultima configurazione
+        private uint Counter(uint cfg, long[] b, uint start)
+        {
+            int src = (int)((cfg >> 2) & 0xF);
+            if((evCtrl & 1) == 0 || src == 0) { return start; }
+            return unchecked(start + (uint)(CacheModel.L2Events[src] - b[src]));
+        }
+
+        private static long[] Snapshot() { return (long[])CacheModel.L2Events.Clone(); }
+
+        private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
+        private uint evCtrl, cnt0, cnt1, cfg0, cfg1;
+        private long[] base0, base1;
     }
 
     // Ogni accesso del processore ai registri delle periferiche del banco passa di qui:
@@ -286,6 +721,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
             if(BoardClock.Mode == ClockMode.Cpu)
             {
                 CpuClock.Charge(latencySeconds);
+                CacheModel.FlushPmu();
                 Scheduler.RunDue();
             }
             return Interlocked.Increment(ref seq);
@@ -436,7 +872,21 @@ namespace Antmicro.Renode.Peripherals.Zybo
             }
         }
 
-        public double CyclesPerInstruction { get { return CpuClock.CyclesPerInstruction; } set { CpuClock.CyclesPerInstruction = value; } }
+        public double CyclesPerInstruction
+        {
+            get { return CpuClock.CyclesPerInstruction; }
+            set { CpuClock.CyclesPerInstruction = value; Zybo.CacheModel.SyncCyclesPerInstruction(); }
+        }
+
+        // Modello delle cache e PMU allineato al tempo CPU (globalTimer CacheModel true|false,
+        // dopo "machine Reset"): costi di miss in cicli, configurabili per la taratura
+        public bool CacheModel
+        {
+            get { return Zybo.CacheModel.Active; }
+            set { Zybo.CacheModel.Install(machine, value); }
+        }
+        public int L2HitCycles { get { return Zybo.CacheModel.L2HitCycles; } set { Zybo.CacheModel.L2HitCycles = value; } }
+        public int DdrCycles { get { return Zybo.CacheModel.DdrCycles; } set { Zybo.CacheModel.DdrCycles = value; } }
         public double PlReadNs { get { return CpuClock.PlReadSeconds * 1e9; } set { CpuClock.PlReadSeconds = value * 1e-9; } }
         public double PlWriteNs { get { return CpuClock.PlWriteSeconds * 1e9; } set { CpuClock.PlWriteSeconds = value * 1e-9; } }
 
@@ -1418,6 +1868,61 @@ namespace Antmicro.Renode.Peripherals.Zybo
     // Con abort = false la zona contiene un blocco che c'e' sulla scheda ma non e' emulato:
     // l'accesso restituisce 0 e viene segnalato.
     // ==================================================================
+    // Data Abort per errore di bus (DECERR dall'interconnect), come sul Cortex-A9 r3p0:
+    //  - lettura: abort sincrono (preciso). DFSR = 0x008 (external abort, non di traduzione),
+    //    DFAR = indirizzo, LR_abt = istruzione + 8: DataAbortAddr del BSP indica l'istruzione giusta;
+    //  - scrittura: abort asincrono (impreciso), perche' il dato e' gia' partito nel buffer di scrittura.
+    //    DFSR = 0x406, DFAR non valido, l'eccezione arriva qualche istruzione dopo.
+    // tlib prende l'eccezione alla fine del blocco tradotto: per le letture l'hook di inizio
+    // eccezione rimette il PC sull'istruzione che ha fatto l'accesso prima che venga calcolato LR.
+    public static class DataAbort
+    {
+        public const uint ExceptionDataAbort = 4;            // EXCP_DATA_ABORT di tlib
+
+        public static bool Raise(ICPU cpu, ulong pc, bool read, ulong address)
+        {
+            var tcpu = cpu as TranslationCPU;
+            if(tcpu == null) { return false; }
+            try
+            {
+                if(!ReferenceEquals(hooked, tcpu))
+                {
+                    hooked = tcpu;
+                    tcpu.AddHookAtInterruptBegin(OnInterruptBegin);
+                }
+                var arm = tcpu as Arm;
+                if(arm != null)
+                {
+                    arm.SetSystemRegisterValue("DFSR", read ? 0x008u : 0x406u);
+                    if(read) { arm.SetSystemRegisterValue("DFAR", address); }
+                }
+                pendingPc = pc;
+                pendingPrecise = read;
+                pending = true;
+                tcpu.RaiseException(ExceptionDataAbort);
+                return true;
+            }
+            catch(Exception)
+            {
+                return false;
+            }
+        }
+
+        private static void OnInterruptBegin(ulong index)
+        {
+            if(index != ExceptionDataAbort || !pending) { return; }
+            pending = false;
+            if(pendingPrecise && hooked != null)
+            {
+                try { hooked.PC = pendingPc; } catch(Exception) { }
+            }
+        }
+
+        private static TranslationCPU hooked;
+        private static ulong pendingPc;
+        private static bool pending, pendingPrecise;
+    }
+
     public class BusErrorRegion : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize
     {
         public BusErrorRegion(IMachine machine, long baseAddress, long size, string label = "PL", bool abort = true)
@@ -1455,7 +1960,12 @@ namespace Antmicro.Renode.Peripherals.Zybo
                     faulted = true;
                     ZyboUi.Send("{\"t\":\"abort\",\"op\":\"" + op + "\",\"size\":\"" + width + "\",\"addr\":\"" + addr +
                                 "\",\"pc\":\"0x" + pc.ToString("X8") + "\",\"label\":\"" + label + "\"}");
-                    if(cpu != null) { cpu.IsHalted = true; }
+                }
+                // ogni accesso sbagliato genera il suo abort: se il gestore del programma ritorna
+                // ("subs pc, lr, #8") l'istruzione viene rieseguita e abortisce di nuovo, come sulla scheda
+                if(!DataAbort.Raise(cpu, pc, op == "Read", (ulong)(baseAddress + offset)) && cpu != null)
+                {
+                    cpu.IsHalted = true;        // CPU che non sa ricevere l'eccezione: almeno si ferma
                 }
             }
             else
@@ -1513,10 +2023,38 @@ namespace Antmicro.Renode.Peripherals.Zybo
             }
         }
 
+        // Audio reale su LINE IN (file WAV o registrazione dal microfono, convertiti dal server):
+        // campioni a 16 bit interi, 1 o 2 canali interlacciati, alla frequenza 'rate'. Riprodotto in
+        // ciclo dall'inizio a ogni esecuzione; con "file" il livello e' un guadagno (0 dB = come il file).
+        public static void LoadInputFile(string path, double rate, int channels)
+        {
+            var bytes = System.IO.File.ReadAllBytes(path);
+            channels = Math.Max(1, Math.Min(2, channels));
+            int n = bytes.Length / (2 * channels);
+            var l = new float[n];
+            var r = new float[n];
+            for(int i = 0; i < n; i++)
+            {
+                l[i] = BitConverter.ToInt16(bytes, i * channels * 2) / 32768f;
+                r[i] = channels > 1 ? BitConverter.ToInt16(bytes, (i * channels + 1) * 2) / 32768f : l[i];
+            }
+            lock(Sync)
+            {
+                Advance();
+                fileL = l;
+                fileR = r;
+                fileRate = rate > 0 ? rate : 48000;
+                filePos = 0;
+            }
+        }
+
+        public static double InputFileSeconds { get { lock(Sync) { return fileL == null ? 0 : fileL.Length / fileRate; } } }
+
         public static void Reset()
         {
             lock(Sync)
             {
+                filePos = 0;                                     // il file riparte dall'inizio
                 streaming = false; rxEn = false; txEn = false; clkCtrl = 0;
                 rxHead = rxCount = 0; txHead = txCount = 0; txPending.Clear(); txStarted = false;
                 lostWords = underWords = 0; isr = 0; ier = 0; warnedIer = warnedTse = false;
@@ -1996,6 +2534,20 @@ namespace Antmicro.Renode.Peripherals.Zybo
             double v;
             switch(inType)
             {
+            case "file":
+                if(fileL == null || fileL.Length < 2) { inL = inR = 0; return; }
+                {
+                    // interpolazione lineare: il file puo' avere una frequenza diversa da quella del codec
+                    int n = fileL.Length;
+                    int i = (int)filePos;
+                    double f = filePos - i;
+                    int j = i + 1 < n ? i + 1 : 0;
+                    inL = a * (fileL[i] * (1 - f) + fileL[j] * f);
+                    inR = a * (fileR[i] * (1 - f) + fileR[j] * f);
+                    filePos += fileRate / fs;
+                    if(filePos >= n) { filePos -= n; }
+                }
+                return;
             case "silence":
                 v = 0;
                 break;
@@ -2099,6 +2651,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static long lastAdcIdx = -1, lastDacIdx = -1;
         private static string inType = "sine";
         private static double inFreq = 1000, inLevelDb = -12;
+        private static float[] fileL, fileR;
+        private static double fileRate = 48000, filePos;
     }
 
     // axi_i2s_adi (Analog Devices), registri del controllore: RESET 0x00, CTRL 0x04, CLK_CTRL 0x08
@@ -2121,6 +2675,12 @@ namespace Antmicro.Renode.Peripherals.Zybo
         public void SetInput(string type, double freq, double levelDb)
         {
             AudioPath.SetInput(type, freq, levelDb);
+        }
+
+        // audio reale su LINE IN:  i2s LoadInputFile "percorso.raw" 48000 2   (PCM 16 bit interlacciato)
+        public void LoadInputFile(string path, double rate, int channels)
+        {
+            AudioPath.LoadInputFile(path, rate, channels);
         }
 
         public uint ReadDoubleWord(long offset)

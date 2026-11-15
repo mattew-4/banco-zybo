@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from zyboemu import build, emulator  # noqa: E402
+from zyboemu import audiofile, build, emulator  # noqa: E402
 
 ROOT = HERE.parent
 WEB = ROOT / "web"
@@ -340,9 +340,27 @@ class Handler(BaseHTTPRequestHandler):
                 if EMU.state in ("running", "paused", "idle"):
                     EMU.set_sensor(send)
                 return self._json({"ok": True, "sensor": SENSOR})
+            if p == "/api/audiofile":
+                # audio reale per LINE IN: corpo = file WAV (dall'interfaccia: file scelto o microfono)
+                data = self._body()
+                if not data or len(data) > 200 * 1024 * 1024:
+                    return self._json({"error": "file assente o troppo grande"}, 400)
+                name = (parse_qs(urlparse(self.path).query).get("name") or ["audio.wav"])[0][:80]
+                try:
+                    info = audiofile.wav_to_raw(data, WORK / "audio_in.raw")
+                except audiofile.WavError as e:
+                    return self._json({"error": f"File audio non valido: {e}"}, 400)
+                info.update(path=str(WORK / "audio_in.raw"), name=name)
+                AUDIO["file"] = info
+                AUDIO["type"] = "file"
+                AUDIO["level"] = 0.0
+                if EMU.state in ("running", "paused", "idle"):
+                    EMU.set_audio_input(AUDIO)
+                return self._json({"ok": True, "audio": AUDIO})
             if p == "/api/audioin":
                 d = self._body_json()
-                if d.get("type") in ("sine", "square", "sweep", "noise", "silence"):
+                if d.get("type") in ("sine", "square", "sweep", "noise", "silence") or \
+                        (d.get("type") == "file" and AUDIO.get("file")):
                     AUDIO["type"] = d["type"]
                 if "freq" in d:
                     AUDIO["freq"] = min(23000.0, max(20.0, float(d["freq"])))

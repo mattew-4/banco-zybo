@@ -537,14 +537,17 @@ function warn(html, key) {
 }
 function onAbort(e) {
   const b = $("#stateBadge");
-  b.className = "badge paused"; b.textContent = "bloccato: Data Abort";
-  // la UART finisce di trasmettere i caratteri gia' nella sua FIFO anche a CPU ferma (come sulla
-  // scheda): il messaggio arriva dopo, cosi' sul Serial Monitor l'ordine e' quello reale
-  setTimeout(() => termSys(`── DATA ABORT: ${e.op === "Read" ? "lettura" : "scrittura"} a ${e.addr} dall'istruzione a ${e.pc}. ` +
-          `In quella zona della PL non c'è nessun blocco: sulla scheda l'interconnect risponde con un errore (DECERR), ` +
-          `il processore va in Data Abort e il gestore del BSP si ferma in un ciclo infinito. Il programma è bloccato qui. ──`), 600);
-  warn(`⛔ <b>Data Abort</b>: ${e.op === "Read" ? "lettura" : "scrittura"} a <b>${e.addr}</b> (istruzione a ${e.pc}), dove la PL non ha nessun blocco. ` +
-       `Come sulla scheda, il programma si è fermato. Controlla l'indirizzo: nel tab «Assembly ARM» trovi l'istruzione.`, "abort" + e.addr);
+  b.className = "badge paused"; b.textContent = "Data Abort";
+  const rd = e.op === "Read";
+  // la UART finisce di trasmettere i caratteri gia' nella sua FIFO (come sulla scheda):
+  // il messaggio arriva dopo, cosi' sul Serial Monitor l'ordine e' quello reale
+  setTimeout(() => termSys(`── DATA ABORT: ${rd ? "lettura" : "scrittura"} a ${e.addr} dall'istruzione a ${e.pc}. ` +
+          `In quella zona della PL non c'è nessun blocco: l'interconnect risponde con un errore (DECERR) e il processore ` +
+          `entra nel gestore del Data Abort (${rd ? "preciso: DFAR = indirizzo, DFSR = 0x008" : "impreciso, qualche istruzione dopo: DFSR = 0x406"}). ` +
+          `Se il programma non ne ha registrato uno, quello del BSP si ferma in un ciclo infinito: il programma è bloccato. ──`), 600);
+  warn(`⛔ <b>Data Abort</b>: ${rd ? "lettura" : "scrittura"} a <b>${e.addr}</b> (istruzione a ${e.pc}), dove la PL non ha nessun blocco. ` +
+       `Come sulla scheda, il processore è passato al gestore del Data Abort (quello predefinito del BSP blocca il programma). ` +
+       `Controlla l'indirizzo: nel tab «Assembly ARM» trovi l'istruzione.`, "abort" + e.addr);
 }
 function onUnmapped(e) {
   if (e.label) {
@@ -751,12 +754,86 @@ $("#listenBtn").addEventListener("click", (e) => { if (e.target.tagName !== "SEL
 $("#listenStop").addEventListener("click", stopListen);
 
 let ainTimer = null;
-function sendAudioIn() {
-  $("#ainLevelv").textContent = $("#ainLevel").value + " dBFS";
+function ainLabels() {
+  const file = $("#ainType").value === "file";
+  $("#ainFreqBox").classList.toggle("hidden", file);
+  $("#ainLevelLbl").textContent = file ? "guadagno" : "livello";
+  $("#ainLevelv").textContent = $("#ainLevel").value + (file ? " dB" : " dBFS");
+}
+function sendAudioIn(e) {
+  if (e && e.target.id === "ainType" && $("#ainType").value === "file" && $("#ainFileInfo").textContent.startsWith("nessun")) {
+    $("#ainFile").click();                     // nessun audio caricato: si sceglie subito il file
+  }
+  ainLabels();
   clearTimeout(ainTimer);
   ainTimer = setTimeout(() => api("/api/audioin", { type: $("#ainType").value, freq: +$("#ainFreq").value, level: +$("#ainLevel").value }), 60);
 }
 ["ainType", "ainFreq", "ainLevel"].forEach((id) => $("#" + id).addEventListener("input", sendAudioIn));
+
+// ---- audio reale: file o microfono -> WAV 16 bit -> server -> LINE IN del banco ----
+function showAudioFile(f) {
+  $("#ainFileInfo").textContent = f
+    ? `${f.name}: ${f.seconds.toFixed(1)} s, ${f.rate} Hz, ${f.channels === 2 ? "stereo" : "mono"}, in ciclo${f.truncated ? " (tagliato a 120 s)" : ""}`
+    : "nessun audio reale caricato";
+}
+function encodeWav(buf) {                      // AudioBuffer -> WAV PCM 16 bit (max 2 canali)
+  const ch = Math.min(2, buf.numberOfChannels), n = buf.length, out = new DataView(new ArrayBuffer(44 + n * ch * 2));
+  const w = (o, s) => [...s].forEach((c, i) => out.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); out.setUint32(4, 36 + n * ch * 2, true); w(8, "WAVEfmt "); out.setUint32(16, 16, true);
+  out.setUint16(20, 1, true); out.setUint16(22, ch, true); out.setUint32(24, buf.sampleRate, true);
+  out.setUint32(28, buf.sampleRate * ch * 2, true); out.setUint16(32, ch * 2, true); out.setUint16(34, 16, true);
+  w(36, "data"); out.setUint32(40, n * ch * 2, true);
+  const data = [...Array(ch).keys()].map((c) => buf.getChannelData(c));
+  for (let i = 0, o = 44; i < n; i++) for (let c = 0; c < ch; c++, o += 2)
+    out.setInt16(o, Math.max(-32768, Math.min(32767, Math.round(data[c][i] * 32768))), true);
+  return out.buffer;
+}
+async function uploadAudio(name, arrayBuf) {
+  $("#ainFileInfo").textContent = "conversione…";
+  try {
+    let wav = arrayBuf;
+    const head = new TextDecoder().decode(new Uint8Array(arrayBuf, 0, Math.min(12, arrayBuf.byteLength)));
+    if (!(head.startsWith("RIFF") && head.endsWith("WAVE"))) {
+      // MP3, OGG, registrazione del microfono...: decodifica del browser, poi WAV
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const buf = await ctx.decodeAudioData(arrayBuf.slice(0));
+      ctx.close();
+      wav = encodeWav(buf);
+    }
+    const r = await api("/api/audiofile?name=" + encodeURIComponent(name), wav, true);
+    if (r.error) throw new Error(r.error);
+    $("#ainType").value = "file"; $("#ainLevel").value = r.audio.level;
+    ainLabels(); showAudioFile(r.audio.file);
+  } catch (err) {
+    $("#ainFileInfo").textContent = "⚠ " + (err.message || err);
+  }
+}
+$("#ainFileBtn").addEventListener("click", () => $("#ainFile").click());
+$("#ainFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (f) uploadAudio(f.name, await f.arrayBuffer());
+  e.target.value = "";
+});
+$("#ainMicBtn").addEventListener("click", async () => {
+  const btn = $("#ainMicBtn"), secs = +$("#ainMicSecs").value;
+  if (!navigator.mediaDevices || !window.MediaRecorder) { $("#ainFileInfo").textContent = "⚠ questo browser non permette di registrare"; return; }
+  let stream;
+  try {
+    // niente elaborazioni del browser: si vuole il segnale com'e', come da un cavo su LINE IN
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch (err) { $("#ainFileInfo").textContent = "⚠ microfono non disponibile: " + (err.message || err); return; }
+  const rec = new MediaRecorder(stream), parts = [];
+  rec.ondataavailable = (ev) => parts.push(ev.data);
+  rec.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    btn.disabled = false; btn.textContent = "🎙 Registra dal microfono";
+    uploadAudio(`microfono (${secs} s)`, await new Blob(parts).arrayBuffer());
+  };
+  btn.disabled = true;
+  rec.start();
+  for (let k = secs; k > 0; k--) { btn.textContent = `🔴 registro… ${k} s`; await new Promise((r) => setTimeout(r, 1000)); }
+  rec.stop();
+});
 $("#clockSel").addEventListener("change", () => api("/api/config", { clock: $("#clockSel").value }));
 (async () => {
   try {
@@ -764,7 +841,7 @@ $("#clockSel").addEventListener("change", () => api("/api/config", { clock: $("#
     if (s.clock) $("#clockSel").value = s.clock;
     if (s.audio) {
       $("#ainType").value = s.audio.type; $("#ainFreq").value = s.audio.freq; $("#ainLevel").value = s.audio.level;
-      $("#ainLevelv").textContent = s.audio.level + " dBFS";
+      ainLabels(); showAudioFile(s.audio.file);
     }
   } catch { }
 })();

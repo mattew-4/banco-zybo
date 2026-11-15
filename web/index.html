@@ -147,9 +147,17 @@ e caricato in DDR a 0x0010_0000 sulla Zybo emulata.</pre></div>
           <option value="sweep">sweep 100 Hz – 10 kHz</option>
           <option value="noise">rumore bianco</option>
           <option value="silence">silenzio</option>
+          <option value="file">audio reale (file o microfono)</option>
         </select>
-        <label>f <input type="number" id="ainFreq" min="20" max="23000" step="1" value="1000"> Hz</label>
-        <label>livello <input type="range" id="ainLevel" min="-60" max="0" step="1" value="-12"> <b id="ainLevelv">-12 dBFS</b></label>
+        <label id="ainFreqBox">f <input type="number" id="ainFreq" min="20" max="23000" step="1" value="1000"> Hz</label>
+        <label><span id="ainLevelLbl">livello</span> <input type="range" id="ainLevel" min="-60" max="0" step="1" value="-12"> <b id="ainLevelv">-12 dBFS</b></label>
+      </div>
+      <div class="audio-in audio-real" id="ainReal">
+        <button class="btn small" id="ainFileBtn" title="WAV, MP3, OGG...: il browser lo decodifica, il banco lo riproduce in ciclo su LINE IN">🎵 Apri file audio</button>
+        <input type="file" id="ainFile" accept="audio/*,.wav" hidden>
+        <button class="btn small" id="ainMicBtn" title="Registra dal microfono del PC e lo usa come ingresso LINE IN, come il telefono collegato in laboratorio">🎙 Registra dal microfono</button>
+        <select id="ainMicSecs" title="Durata della registrazione"><option>3</option><option selected>5</option><option>10</option><option>20</option></select> s
+        <span class="muted" id="ainFileInfo">nessun audio reale caricato</span>
       </div>
       <div class="fifo-head">
         <span>FIFO RX: parole in attesa (K = 512) · ultimi <b id="fifoSpan">0,5</b> s</span>
@@ -232,8 +240,9 @@ e caricato in DDR a 0x0010_0000 sulla Zybo emulata.</pre></div>
         <li><b>Orologio «tempo reale»</b> (Lab 1-2): global timer e timer privato contano in tempo reale (333,33 MHz): <code>usleep</code>, <code>XTime_GetTime</code>, lampeggi e debounce durano come sulla scheda e la UART esce al baud rate. Ma la CPU emulata è più lenta del Cortex-A9 a 667 MHz: i tempi di <i>esecuzione</i> misurati dal programma sono più alti che sulla scheda.</li>
         <li><b>Orologio «tempo CPU»</b> (Lab 3, scelto da solo se il programma usa l'audio): il tempo della scheda si calcola dalle istruzioni eseguite (in media 1,51 cicli a istruzione a 667 MHz, tarato sui 157 µs dell'FFT N = 512 a -O2 del Lab 3) più il costo degli accessi ai registri (PL ~1 µs in lettura e 0,7 µs in scrittura, UART ~0,15 µs). Le durate misurate dal programma sono quelle del Cortex-A9 anche se l'emulazione è più lenta. Le cache non sono modellate: -O1 e -O2 risultano quasi uguali, e misure ripetute danno sempre lo stesso valore (sulla scheda max e media differiscono di poco).</li>
         <li><b>Audio (Lab 3):</b> codec SSM2603 su I2C0 (registri, guadagni, accensione), controllore axi_i2s_adi (fs dai divisori del clock) e AXI4-Stream FIFO PG080 con FIFO RX e TX da 512 parole: il codec consegna una parola ogni 10,4 µs che il programma legga o no, le parole in più si perdono (overrun) e il DAC suona silenzio se manca un campione (underrun). LINE IN è un generatore di segnale; l'uscita si ascolta in differita.</li>
-        <li><b>Programmi sbagliati:</b> la scheda emulata sbaglia come quella vera. Un accesso a un indirizzo della PL senza blocco dà Data Abort e il programma si blocca; codec configurato male (formato, master, frequenza, non attivo) dà audio distorto, rumore o silenzio; FIFO non letta in tempo perde parole; pacchetto TX non chiuso con TLR blocca il programma; le variabili locali non inizializzate contengono residui, non zeri.</li>
-        <li><b>Diverso:</b> in tempo reale un trasferimento I2C finisce subito (in tempo CPU dura quanto a 100 kHz); le cache non sono modellate; la seconda FIFO del design e gli interrupt delle FIFO non sono emulati (il banco lo segnala).</li>
+        <li><b>Programmi sbagliati:</b> la scheda emulata sbaglia come quella vera. Un accesso a un indirizzo della PL senza blocco dà un Data Abort vero (DFSR e DFAR come sulla scheda): parte il gestore del programma o, se manca, quello del BSP blocca il programma; codec configurato male (formato, master, frequenza, non attivo) dà audio distorto, rumore o silenzio; FIFO non letta in tempo perde parole; pacchetto TX non chiuso con TLR blocca il programma; le variabili locali non inizializzate contengono residui, non zeri.</li>
+        <li><b>Cache e PMU:</b> per i programmi che leggono i contatori del PMU o usano le funzioni Xil_DCache*/Xil_L2Cache* il banco modella L1D (32 KB) e L2 PL310 (512 KB): i miss costano cicli, PMCCNTR conta i cicli del tempo CPU. L'emulazione è circa 5 volte più lenta.</li>
+        <li><b>Diverso:</b> in tempo reale un trasferimento I2C finisce subito (in tempo CPU dura quanto a 100 kHz); per gli altri programmi le cache non sono modellate; la seconda FIFO del design e gli interrupt delle FIFO non sono emulati (il banco lo segnala).</li>
       </ul>
     </details>
   </section>

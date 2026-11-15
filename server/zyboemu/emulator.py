@@ -42,7 +42,8 @@ PS7_INIT_UART1 = [
 #                misurati sulla scheda (testo del Lab 3)
 #   pl_read_ns   lettura di un registro nella PL (bus M_AXI_GP0, AXI4-Stream FIFO, AXI GPIO)
 #   pl_write_ns  scrittura (memoria strongly-ordered: il processore attende la risposta)
-TIMING_DEFAULTS = {"cpi": 1.51, "pl_read_ns": 1000.0, "pl_write_ns": 700.0}
+TIMING_DEFAULTS = {"cpi": 1.51, "pl_read_ns": 1000.0, "pl_write_ns": 700.0,
+                   "l2_hit_cycles": 25.0, "ddr_cycles": 60.0, "cache": 2.0, "cpi_cache": 1.40}
 
 _ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\xff[\xfb-\xfe].|\xff\xfa.*?\xff\xf0|[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
@@ -128,6 +129,50 @@ def uses_audio(elf: pathlib.Path) -> bool:
     return False
 
 
+_CACHE_SYMBOLS = (b"\0Xil_DCache", b"\0Xil_L1DCache", b"\0Xil_L2Cache", b"\0Xpm_")
+
+
+def uses_cache(elf: pathlib.Path) -> bool:
+    """True se il programma misura o gestisce le cache: legge i contatori del PMU (mrc p15 su c9,
+    c13, in ARM o Thumb-2) oppure usa le funzioni del BSP Xil_DCache*, Xil_L1DCache*,
+    Xil_L2Cache* o Xpm_*. Solo per questi programmi il banco attiva il modello delle cache, che
+    rende l'emulazione circa 5 volte piu' lenta."""
+    try:
+        data = pathlib.Path(elf).read_bytes()
+        if data[:4] != b"\x7fELF" or data[4] != 1:
+            return False
+        shoff = int.from_bytes(data[0x20:0x24], "little")
+        shentsize = int.from_bytes(data[0x2E:0x30], "little")
+        shnum = int.from_bytes(data[0x30:0x32], "little")
+        shstrndx = int.from_bytes(data[0x32:0x34], "little")
+        heads = [data[shoff + k * shentsize: shoff + (k + 1) * shentsize] for k in range(shnum)]
+        names_off = int.from_bytes(heads[shstrndx][16:20], "little")
+        for h in heads:
+            sh_name = int.from_bytes(h[0:4], "little")
+            sh_type = int.from_bytes(h[4:8], "little")
+            sh_flags = int.from_bytes(h[8:12], "little")
+            off = int.from_bytes(h[16:20], "little")
+            size = int.from_bytes(h[20:24], "little")
+            name = data[names_off + sh_name: data.index(b"\0", names_off + sh_name)]
+            sec = data[off:off + size]
+            if name == b".strtab" and any(s in sec for s in _CACHE_SYMBOLS):
+                return True
+            if sh_type != 1 or not (sh_flags & 0x4):
+                continue
+            # solo le LETTURE dei contatori (mrc p15, 0, rX, c9, c13, {0,2}: PMCCNTR, PMXEVCNTR): le
+            # scritture ci sono in ogni programma, perche' __cpu_init del BSP abilita il contatore di cicli
+            for i in range(0, len(sec) - 3, 2):
+                w = int.from_bytes(sec[i:i + 4], "little")
+                if i % 4 == 0 and (w & 0x0FFF0F1F) == 0x0E190F1D:                     # ARM
+                    return True
+                hw1, hw2 = w & 0xFFFF, w >> 16
+                if hw1 == 0xEE19 and (hw2 & 0x0F1F) == 0x0F1D:                         # Thumb-2
+                    return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def _free_port(kind=socket.SOCK_STREAM) -> int:
     s = socket.socket(socket.AF_INET, kind)
     s.bind(("127.0.0.1", 0))
@@ -155,6 +200,7 @@ class Emulator:
         self.clock = "real"
         self.last_run: dict = {}
         self._boot_error: str | None = None
+        self.cache_model = False
         self._cmdq: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -271,22 +317,33 @@ class Emulator:
         self.elf = elf
         self.instructions = None
         audio_prog = uses_audio(elf)
-        mode = clock if clock in ("real", "cpu") else ("cpu" if audio_prog else "real")
+        # tempo CPU anche per chi misura le prestazioni (PMU, cache): in tempo reale misurerebbe il PC
+        mode = clock if clock in ("real", "cpu") else ("cpu" if audio_prog or uses_cache(elf) else "real")
         self.clock = mode
         self.last_run = {"sensor": sensor, "clock": clock, "audio": audio}
         # taratura del tempo CPU (config.json, "timing"): cicli per istruzione e latenze dei registri della PL
         t = dict(TIMING_DEFAULTS)
         for k, v in (timing or {}).items():
-            if k in t and isinstance(v, (int, float)) and v > 0:
+            if k in t and isinstance(v, (int, float)) and (v > 0 or (k == "cache" and v == 0)):
                 t[k] = float(v)
+        cache_on = mode == "cpu" and (t["cache"] == 1 or (t["cache"] >= 2 and uses_cache(elf)))
+        self.cache_model = cache_on
+        # con le cache modellate parte del tempo e' nei miss: il CPI medio e' piu' basso, tarato in
+        # modo che l'FFT del Lab 3 (N = 512, -O2) duri gli stessi 157 us
+        cpi = t["cpi_cache"] if cache_on else t["cpi"]
         cmds = [
             "pause",
-            f"globalTimer CyclesPerInstruction {t['cpi']:.4f}",
+            f"globalTimer CyclesPerInstruction {cpi:.3f}",
             f"globalTimer PlReadNs {t['pl_read_ns']:.1f}",
             f"globalTimer PlWriteNs {t['pl_write_ns']:.1f}",
             f'globalTimer ClockMode "{mode}"',
             "machine Reset",                       # reset di CPU e periferiche, orologio a 0
             "cpu IsHalted false",                  # dopo un Data Abort la CPU era stata fermata: si riparte
+            # tempo CPU: cache L1D/L2 modellate (i miss costano cicli) e PMU allineato all'orologio;
+            # timing "cache": 2 = solo per i programmi che usano PMU o funzioni di cache, 1 = sempre, 0 = mai
+            f"globalTimer L2HitCycles {int(t['l2_hit_cycles'])}",
+            f"globalTimer DdrCycles {int(t['ddr_cycles'])}",
+            f"globalTimer CacheModel {'true' if cache_on else 'false'}",
             # DDR "sporca" come sulla scheda (residui, non zeri): i primi 32 MB, dove stanno programma,
             # stack e heap; i dati cambiano a ogni esecuzione
             f"globalTimer ScrambleMemory 0x100000 0x2000000 {int(time.time() * 1000) & 0x7FFFFFFF}",
@@ -310,9 +367,19 @@ class Emulator:
     @staticmethod
     def _audio_cmds(a: dict) -> list[str]:
         kind = a.get("type", "sine")
-        if kind not in ("sine", "square", "sweep", "noise", "silence"):
+        if kind not in ("sine", "square", "sweep", "noise", "silence", "file"):
             kind = "sine"
-        return [f'i2s SetInput "{kind}" {float(a.get("freq", 1000)):.2f} {float(a.get("level", -12)):.2f}']
+        cmds = []
+        f = a.get("file") or {}
+        if kind == "file":
+            if f.get("path") and pathlib.Path(f["path"]).is_file():
+                # audio reale (WAV o microfono) gia' convertito dal server in PCM 16 bit
+                cmds.append(f'i2s LoadInputFile "{_rp(pathlib.Path(f["path"]))}" '
+                            f'{float(f.get("rate", 48000)):.1f} {int(f.get("channels", 2))}')
+            else:
+                kind = "silence"
+        cmds.append(f'i2s SetInput "{kind}" {float(a.get("freq", 1000)):.2f} {float(a.get("level", -12)):.2f}')
+        return cmds
 
     def pause(self):
         if self.state == "running":
