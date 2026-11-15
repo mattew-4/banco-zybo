@@ -70,6 +70,23 @@ jobs:
           fi
           exit $rc
 
+      - name: Programmi sbagliati (Data Abort, codec non attivo)
+        shell: bash
+        run: |
+          set +e
+          python -I server/selftest.py tests/pl_data_abort.c 6 --expect "prima dell'accesso" \
+            --expect-not "dopo l'accesso" --expect-abort > wrong.log 2>&1
+          rc1=$?
+          python -I server/selftest.py tests/codec_inactive.c 30 --input "sine 1000 -12" \
+            --expect "picco con codec non attivo: zero" >> wrong.log 2>&1
+          rc2=$?
+          cat wrong.log
+          if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then
+            msg=$(tail -n 60 wrong.log | cut -c1-200 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=sbagliati::${msg}"
+            exit 1
+          fi
+
       - name: Server web e chiusura di Renode (macOS/Linux)
         if: runner.os != 'Windows'
         shell: bash

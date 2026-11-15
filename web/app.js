@@ -535,7 +535,22 @@ function warn(html, key) {
   box.classList.remove("hidden");
   box.innerHTML += (box.innerHTML ? "<br>" : "") + html;
 }
+function onAbort(e) {
+  const b = $("#stateBadge");
+  b.className = "badge paused"; b.textContent = "bloccato: Data Abort";
+  // la UART finisce di trasmettere i caratteri gia' nella sua FIFO anche a CPU ferma (come sulla
+  // scheda): il messaggio arriva dopo, cosi' sul Serial Monitor l'ordine e' quello reale
+  setTimeout(() => termSys(`── DATA ABORT: ${e.op === "Read" ? "lettura" : "scrittura"} a ${e.addr} dall'istruzione a ${e.pc}. ` +
+          `In quella zona della PL non c'è nessun blocco: sulla scheda l'interconnect risponde con un errore (DECERR), ` +
+          `il processore va in Data Abort e il gestore del BSP si ferma in un ciclo infinito. Il programma è bloccato qui. ──`), 600);
+  warn(`⛔ <b>Data Abort</b>: ${e.op === "Read" ? "lettura" : "scrittura"} a <b>${e.addr}</b> (istruzione a ${e.pc}), dove la PL non ha nessun blocco. ` +
+       `Come sulla scheda, il programma si è fermato. Controlla l'indirizzo: nel tab «Assembly ARM» trovi l'istruzione.`, "abort" + e.addr);
+}
 function onUnmapped(e) {
+  if (e.label) {
+    warn(`⚠ Accesso a <b>${e.addr}</b> (istruzione a ${e.pc}): ${esc(e.label)}. Sulla scheda il blocco esiste; nel banco legge 0.`, "lbl" + e.label);
+    return;
+  }
   const a = parseInt(e.addr, 16);
   let where = "";
   if (a >= 0x40000000 && a < 0xC0000000) where = "nella PL (M_AXI_GP), dove il bitstream del corso non ha nessun blocco: sulla scheda reale l'interconnect risponde con un errore di bus (DECERR) e il processore va in Data Abort";
@@ -782,6 +797,8 @@ function connect() {
           }
         }
         break;
+      case "abort": onAbort(e); break;
+      case "warn": warn("⚠ " + esc(e.text), e.key); break;
       case "audio": onAudio(e); break;
       case "audio_reset": audReset(); break;
       case "codec": onCodec(e.regs); break;

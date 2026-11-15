@@ -167,6 +167,17 @@ namespace Antmicro.Renode.Peripherals.Zybo
             machine = m;      // la CPU si cerca al primo uso: quando nasce il timer non e' ancora sul bus
         }
 
+        // tempo virtuale di Renode: avanza anche quando la CPU e' ferma (Renode mette in pausa la CPU
+        // su un salto su se stesso, "while (1);", e su WFI)
+        private static double RenodeSeconds
+        {
+            get
+            {
+                try { return machine == null ? 0 : machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds / 1e6; }
+                catch(Exception) { return 0; }
+            }
+        }
+
         public static ulong Instructions
         {
             get
@@ -224,6 +235,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
                 baseSeconds = seconds;
                 extra = 0;
                 last = seconds;
+                lastInstr = instrBase;
+                lastRenode = RenodeSeconds;
             }
         }
 
@@ -231,6 +244,13 @@ namespace Antmicro.Renode.Peripherals.Zybo
         {
             ulong i = Instructions;
             if(i < instrBase) { instrBase = i; }           // il contatore riparte da zero al reset della CPU
+            // CPU ferma (ciclo vuoto, WFI): le istruzioni non avanzano ma il tempo della scheda si',
+            // al passo del tempo virtuale di Renode. Senza questo, un programma che finisce con
+            // "while (1);" fermerebbe anche UART e flusso audio, cosa che sulla scheda non succede.
+            double rv = RenodeSeconds;
+            if(i == lastInstr && rv > lastRenode) { extra += rv - lastRenode; }
+            lastInstr = i;
+            lastRenode = rv;
             double t = baseSeconds + (i - instrBase) * CyclesPerInstruction / CpuHz + extra;
             if(t < last) { t = last; }
             last = t;
@@ -240,8 +260,18 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static readonly object sync = new object();
         private static ICPU cpu;
         private static IMachine machine;
-        private static ulong instrBase;
+        private static ulong instrBase, lastInstr;
+        private static double lastRenode;
         private static double baseSeconds, extra, last;
+    }
+
+    // Durata di un trasferimento I2C a 100 kHz (la velocita' del corso): 9 bit per byte (8 + ACK),
+    // byte di indirizzo compreso. In tempo CPU il programma la "paga" mentre attende la fine del
+    // trasferimento; in tempo reale la seriale I2C emulata e' istantanea.
+    public static class I2cTime
+    {
+        public static double SclHz = 100000;
+        public static double Of(int dataBytes) { return (dataBytes + 1) * 9 / SclHz; }
     }
 
     // Ogni accesso del processore ai registri delle periferiche del banco passa di qui:
@@ -369,6 +399,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
     {
         public A9GlobalTimer(IMachine machine, double frequency = 333333343.5)
         {
+            this.machine = machine;
             this.frequency = frequency;
             IRQ = new GPIO();
             CpuClock.Attach(machine);
@@ -390,6 +421,21 @@ namespace Antmicro.Renode.Peripherals.Zybo
             get { return BoardClock.Mode == Zybo.ClockMode.Cpu ? "cpu" : "real"; }
             set { BoardClock.SetMode(value == "cpu" ? Zybo.ClockMode.Cpu : Zybo.ClockMode.RealTime); }
         }
+        // Memoria come la trova un programma sulla scheda: la DDR contiene i residui di cio' che c'era
+        // prima, non zeri. Si riempie [start, start+size) con dati pseudo-casuali prima di caricare l'ELF:
+        // codice e dati inizializzati vengono poi scritti dal caricamento, .bss lo azzera xil-crt0.S,
+        // mentre stack e heap restano "sporchi" come sulla scheda (variabili locali non inizializzate).
+        public void ScrambleMemory(ulong start, ulong size, int seed)
+        {
+            var rnd = new Random(seed);
+            var buf = new byte[1 << 20];
+            for(ulong a = start; a < start + size; a += (ulong)buf.Length)
+            {
+                rnd.NextBytes(buf);
+                machine.SystemBus.WriteBytes(buf, a);
+            }
+        }
+
         public double CyclesPerInstruction { get { return CpuClock.CyclesPerInstruction; } set { CpuClock.CyclesPerInstruction = value; } }
         public double PlReadNs { get { return CpuClock.PlReadSeconds * 1e9; } set { CpuClock.PlReadSeconds = value * 1e-9; } }
         public double PlWriteNs { get { return CpuClock.PlWriteSeconds * 1e9; } set { CpuClock.PlWriteSeconds = value * 1e-9; } }
@@ -509,6 +555,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         }
 
         private readonly object sync = new object();
+        private readonly IMachine machine;
         private readonly double frequency;
         private uint control, isr, autoInc;
         private ulong comparator, counterBase;
@@ -919,7 +966,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         }
 
         public GPIO IRQ { get; private set; }
-        public long Size { get { return 0x200; } }
+        public long Size { get { return 0x10000; } }    // finestra di 64 KB dell'IP nella mappa del corso
 
         public void Reset()
         {
@@ -1192,6 +1239,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         public void Write(byte[] data)
         {
             if(data.Length == 0) { return; }
+            CpuClock.Charge(I2cTime.Of(data.Length));
             lock(sync)
             {
                 pointer = data[0];
@@ -1213,6 +1261,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public byte[] Read(int count = 1)
         {
+            CpuClock.Charge(I2cTime.Of(count));
             var result = new byte[count];
             byte start;
             lock(sync)
@@ -1361,6 +1410,70 @@ namespace Antmicro.Renode.Peripherals.Zybo
     }
 
     // ==================================================================
+    // Zone della PL senza blocchi. Sulla scheda l'interconnect risponde DECERR, il Cortex-A9
+    // prende un Data Abort e il gestore predefinito del BSP Xilinx (Xil_DataAbortHandler, senza
+    // DEBUG) entra in un ciclo infinito: il programma si blocca in silenzio su quell'istruzione.
+    // Renode 1.17 non sa generare il Data Abort sull'errore di bus, quindi il banco riproduce
+    // l'effetto: la CPU si ferma sull'istruzione che ha fatto l'accesso e l'interfaccia lo dice.
+    // Con abort = false la zona contiene un blocco che c'e' sulla scheda ma non e' emulato:
+    // l'accesso restituisce 0 e viene segnalato.
+    // ==================================================================
+    public class BusErrorRegion : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize
+    {
+        public BusErrorRegion(IMachine machine, long baseAddress, long size, string label = "PL", bool abort = true)
+        {
+            this.machine = machine;
+            this.baseAddress = baseAddress;
+            this.size = size;
+            this.label = label;
+            this.abort = abort;
+        }
+
+        public long Size { get { return size; } }
+
+        public void Reset() { faulted = false; }
+
+        public byte ReadByte(long offset) { return (byte)Fault(offset, "Read", "Byte"); }
+        public ushort ReadWord(long offset) { return (ushort)Fault(offset, "Read", "Word"); }
+        public uint ReadDoubleWord(long offset) { return Fault(offset, "Read", "DoubleWord"); }
+        public void WriteByte(long offset, byte value) { Fault(offset, "Write", "Byte"); }
+        public void WriteWord(long offset, ushort value) { Fault(offset, "Write", "Word"); }
+        public void WriteDoubleWord(long offset, uint value) { Fault(offset, "Write", "DoubleWord"); }
+
+        private uint Fault(long offset, string op, string width)
+        {
+            ZyboBus.Access(op == "Read" ? CpuClock.PlReadSeconds : CpuClock.PlWriteSeconds);
+            ICPU cpu = null;
+            foreach(var c in machine.SystemBus.GetCPUs()) { cpu = c; break; }
+            ulong pc = 0;
+            try { if(cpu != null) { pc = (ulong)cpu.PC; } } catch(Exception) { }
+            var addr = "0x" + (baseAddress + offset).ToString("X8");
+            if(abort)
+            {
+                if(!faulted)
+                {
+                    faulted = true;
+                    ZyboUi.Send("{\"t\":\"abort\",\"op\":\"" + op + "\",\"size\":\"" + width + "\",\"addr\":\"" + addr +
+                                "\",\"pc\":\"0x" + pc.ToString("X8") + "\",\"label\":\"" + label + "\"}");
+                    if(cpu != null) { cpu.IsHalted = true; }
+                }
+            }
+            else
+            {
+                ZyboUi.Send("{\"t\":\"unmapped\",\"op\":\"" + op + "\",\"size\":\"" + width + "\",\"addr\":\"" + addr +
+                            "\",\"pc\":\"0x" + pc.ToString("X8") + "\",\"label\":\"" + label + "\"}");
+            }
+            return 0;
+        }
+
+        private readonly IMachine machine;
+        private readonly long baseAddress, size;
+        private readonly string label;
+        private readonly bool abort;
+        private bool faulted;
+    }
+
+    // ==================================================================
     // Percorso audio del bitstream del corso (Lab 3, cap. 8 delle dispense):
     //
     //   LINE IN -> SSM2603 (ADC) --I2S--> axi_i2s_adi --AXI4-Stream--> AXI4-Stream FIFO RX (512 parole) -> CPU
@@ -1406,7 +1519,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
             {
                 streaming = false; rxEn = false; txEn = false; clkCtrl = 0;
                 rxHead = rxCount = 0; txHead = txCount = 0; txPending.Clear(); txStarted = false;
-                lostWords = underWords = 0; isr = 0; ier = 0;
+                lostWords = underWords = 0; isr = 0; ier = 0; warnedIer = warnedTse = false;
+                lastAdcIdx = lastDacIdx = -1;
                 pcm.Clear(); occ.Clear(); occBin = -1; halfPending = false;
                 ResetCodecLocked();
                 resetPending = true;
@@ -1440,6 +1554,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
                     streamT0 = BoardClock.Seconds;
                     wordsDone = 0;
                     occBin = -1;
+                    lastAdcIdx = lastDacIdx = -1;
                 }
             }
         }
@@ -1523,7 +1638,15 @@ namespace Antmicro.Renode.Peripherals.Zybo
                 switch(offset)
                 {
                 case 0x00: isr &= ~value; break;                 // W1C
-                case 0x04: ier = value; break;
+                case 0x04:
+                    ier = value;
+                    if(value != 0 && !warnedIer)
+                    {
+                        warnedIer = true;
+                        ZyboUi.Send("{\"t\":\"warn\",\"key\":\"fifo-irq\",\"text\":\"Il programma abilita gli interrupt dell'AXI4-Stream FIFO (IER = 0x" +
+                                    value.ToString("X8") + ", ID 63 sul GIC): nel banco non sono emulati e non arriveranno. Sulla scheda dipendono dalle soglie con cui e' stata generata la FIFO.\"}");
+                    }
+                    break;
                 case 0x08:                                       // TDFR
                     if(value == 0xA5) { ResetTx(); isr |= 1u << 24; }
                     break;
@@ -1532,6 +1655,16 @@ namespace Antmicro.Renode.Peripherals.Zybo
                     else { txPending.Add(value); }
                     break;
                 case 0x14:                                       // TLR: chiude il pacchetto, che parte verso l'I2S
+                    if(value != (uint)txPending.Count * 4)
+                    {
+                        isr |= 1u << 25;                         // TSE: lunghezza diversa dai byte scritti in TDFD
+                        if(!warnedTse)
+                        {
+                            warnedTse = true;
+                            ZyboUi.Send("{\"t\":\"warn\",\"key\":\"fifo-tse\",\"text\":\"TLR = " + value + " byte, ma in TDFD ne sono stati scritti " +
+                                        (txPending.Count * 4) + ": la FIFO segnala TSE (Transmit Size Error). Sulla scheda il pacchetto risulta errato.\"}");
+                        }
+                    }
                     foreach(var p in txPending)
                     {
                         tx[(txHead + txCount) % TxDepth] = p;
@@ -1620,6 +1753,139 @@ namespace Antmicro.Renode.Peripherals.Zybo
             return Math.Pow(10, (v - 0x79) / 20.0);              // 0x79 = 0 dB, passi di 1 dB
         }
 
+        // ---------- interfaccia digitale del codec (R7) e frequenze (R8) ----------
+        // Un campione stereo e' un treno di 64 bit (BCLK = 64 fs): posizioni 0-31 con LRCLK basso,
+        // 32-63 con LRCLK alto. L'axi_i2s_adi lavora sempre in I2S a 24 bit: sinistro dalla posizione 1,
+        // destro dalla 33. Il codec scrive (ADC) e legge (DAC) nelle posizioni del formato impostato in R7.
+        private static int WordLength { get { return new[] { 16, 20, 24, 32 }[(codec[7] >> 2) & 3]; } }
+        private static bool CodecMaster { get { return (codec[7] & 0x40) != 0; } }
+
+        private static void CodecSlots(out int posL, out int posR)
+        {
+            int wl = WordLength;
+            switch(codec[7] & 3)
+            {
+            case 2: posL = 1; posR = 33; break;                  // I2S: LRCLK basso = sinistro, 1 BCLK di ritardo
+            case 1: posL = 32; posR = 0; break;                  // left-justified: LRCLK alto = sinistro, nessun ritardo
+            case 0: posL = 64 - wl; posR = 32 - wl; break;       // right-justified: dati in fondo alla meta'
+            default: posL = 33; posR = 33 + wl; break;           // DSP: L e R di seguito dopo il fronte di LRCLK
+            }
+        }
+
+        private static void PutBits(ref ulong frame, long value, int bits, int pos)
+        {
+            for(int k = 0; k < bits; k++)
+            {
+                int p = (pos + k) & 63;
+                if(((value >> (bits - 1 - k)) & 1) != 0) { frame |= 1UL << (63 - p); }
+            }
+        }
+
+        private static long GetBits(ulong frame, int bits, int pos)
+        {
+            long v = 0;
+            for(int k = 0; k < bits; k++)
+            {
+                v = (v << 1) | (long)((frame >> (63 - ((pos + k) & 63))) & 1);
+            }
+            if(((v >> (bits - 1)) & 1) != 0) { v -= 1L << bits; }   // complemento a 2 su 'bits' bit
+            return v;
+        }
+
+        // ADC -> parole che l'I2S mette nella FIFO RX (24 bit allineati a sinistra nella parola a 32 bit)
+        private static void AdcToCore(double xl, double xr, out uint wl24, out uint wr24)
+        {
+            if(CodecMaster)
+            {
+                // codec e axi_i2s_adi pilotano entrambi BCLK e LRCLK: conflitto sul bus, dati senza senso
+                wl24 = (uint)((rnd.Next(-8388608, 8388607)) << 8);
+                wr24 = (uint)((rnd.Next(-8388608, 8388607)) << 8);
+                return;
+            }
+            int wl = WordLength, pl, pr;
+            CodecSlots(out pl, out pr);
+            ulong frame = 0;
+            PutBits(ref frame, Sample(xl, wl), wl, pl);
+            PutBits(ref frame, Sample(xr, wl), wl, pr);
+            wl24 = (uint)((int)GetBits(frame, 24, 1) << 8);
+            wr24 = (uint)((int)GetBits(frame, 24, 33) << 8);
+        }
+
+        // parole che l'I2S prende dalla FIFO TX -> valori che il DAC converte
+        private static void CoreToDac(uint wl24, uint wr24, out double yl, out double yr)
+        {
+            if(CodecMaster)
+            {
+                yl = (rnd.NextDouble() * 2 - 1) * 0.3;
+                yr = (rnd.NextDouble() * 2 - 1) * 0.3;
+                return;
+            }
+            int wl = WordLength, pl, pr;
+            CodecSlots(out pl, out pr);
+            ulong frame = 0;
+            PutBits(ref frame, (int)wl24 >> 8, 24, 1);
+            PutBits(ref frame, (int)wr24 >> 8, 24, 33);
+            double full = Math.Pow(2, Math.Min(wl, 32) - 1);
+            yl = GetBits(frame, Math.Min(wl, 32), pl) / full;
+            yr = GetBits(frame, Math.Min(wl, 32), pr) / full;
+        }
+
+        // campione dell'ADC (24 bit di risoluzione) rappresentato su wl bit
+        private static long Sample(double x, int wl)
+        {
+            long s = (long)Math.Round(x * 8388608.0);
+            if(s > 8388607) { s = 8388607; }
+            if(s < -8388608) { s = -8388608; }
+            return wl >= 24 ? s << (wl - 24) : s >> (24 - wl);
+        }
+
+        // frequenze di ADC e DAC programmate in R8 con MCLK = 12,288 MHz (data sheet, tabelle di R8)
+        private static void CodecRates(out double fsAdc, out double fsDac)
+        {
+            int r8 = codec[8];
+            bool usb = (r8 & 1) != 0, bosr = (r8 & 2) != 0, div2 = (r8 & 0x40) != 0;
+            int sr = (r8 >> 2) & 0xF;
+            double da, dd;
+            if(usb)
+            {
+                // modo USB: il codec si aspetta MCLK = 12 MHz
+                switch(sr)
+                {
+                case 0x0: da = 250; dd = 250; break;
+                case 0x1: da = 250; dd = 1500; break;
+                case 0x2: da = 1500; dd = 250; break;
+                case 0x3: da = 1500; dd = 1500; break;
+                case 0x6: da = 375; dd = 375; break;
+                case 0x7: da = 125; dd = 125; break;
+                case 0x8: da = 272; dd = 272; break;
+                case 0xF: da = 136; dd = 136; break;
+                default: da = 250; dd = 250; break;
+                }
+            }
+            else
+            {
+                switch(sr)
+                {
+                case 0x0: da = 256; dd = 256; break;           // 48 / 48 kHz
+                case 0x1: da = 256; dd = 1536; break;          // 48 / 8
+                case 0x2: da = 1536; dd = 256; break;          // 8 / 48
+                case 0x3: da = 1536; dd = 1536; break;         // 8 / 8
+                case 0x6: da = 384; dd = 384; break;           // 32 / 32
+                case 0x7: da = 128; dd = 128; break;           // 96 / 96
+                case 0x8: da = 256; dd = 256; break;           // famiglia 44,1 kHz: con 12,288 MHz -> 48
+                case 0x9: da = 256; dd = 1408; break;
+                case 0xA: da = 1408; dd = 256; break;
+                case 0xB: da = 1408; dd = 1408; break;
+                case 0xF: da = 128; dd = 128; break;
+                default: da = 256; dd = 256; break;
+                }
+                if(bosr) { da *= 1.5; dd *= 1.5; }
+            }
+            double mclk = div2 ? Mclk / 2 : Mclk;
+            fsAdc = mclk / da;
+            fsDac = mclk / dd;
+        }
+
         // ---------------- il flusso ----------------
         private static void Advance()
         {
@@ -1631,17 +1897,32 @@ namespace Antmicro.Renode.Peripherals.Zybo
             bool inOn = InputPath, outOn = OutputPath;
             double gl = LineGain(0), gr = LineGain(1), hl = HpGain(2), hr = HpGain(3);
             bool bypass = Active && (codec[4] & 0x08) != 0;
+            double fs = Fs, fsAdc, fsDac;
+            CodecRates(out fsAdc, out fsDac);
+            // il codec e' slave: se R8 programma una frequenza diversa da LRCLK, l'ADC produce campioni
+            // nuovi solo alla sua frequenza e il DAC ne prende solo alla sua (il resto viene ripetuto o perso)
+            bool adcMatch = Math.Abs(fsAdc - fs) < fs * 1e-3, dacMatch = Math.Abs(fsDac - fs) < fs * 1e-3;
             while(wordsDone < target)
             {
                 long w = wordsDone;
                 bool left = (w & 1) == 0;
-                if(left) { GenerateInput(); }
+                long frame = w >> 1;
+                if(left)
+                {
+                    GenerateInput();
+                    long ai = adcMatch ? frame : (long)Math.Floor(frame * fsAdc / fs);
+                    if(ai != lastAdcIdx)
+                    {
+                        lastAdcIdx = ai;
+                        double xl = inOn ? inL * gl + Noise() : 0, xr = inOn ? inR * gr + Noise() : 0;
+                        AdcToCore(xl, xr, out rxWordL, out rxWordR);
+                    }
+                }
 
                 // codec -> FIFO RX
                 if(rxEn)
                 {
-                    double x = inOn ? (left ? inL * gl : inR * gr) + Noise() : 0;
-                    uint word = Quantize(x);
+                    uint word = left ? rxWordL : rxWordR;
                     if(rxCount < RxDepth)
                     {
                         rx[(rxHead + rxCount) % RxDepth] = word;
@@ -1654,13 +1935,13 @@ namespace Antmicro.Renode.Peripherals.Zybo
                     }
                 }
 
-                // FIFO TX -> codec
-                double y = 0;
+                // FIFO TX -> I2S: una parola per slot; se manca, nello slot escono zeri
+                uint tword = 0;
                 if(txEn)
                 {
                     if(txCount > 0)
                     {
-                        y = (int)tx[txHead] / 2147483648.0;
+                        tword = tx[txHead];
                         txHead = (txHead + 1) % TxDepth;
                         txCount--;
                     }
@@ -1669,11 +1950,24 @@ namespace Antmicro.Renode.Peripherals.Zybo
                         underWords++;                            // underrun: il DAC non ha niente da suonare
                     }
                 }
-                double o = outOn ? y * (left ? hl : hr) : 0;
-                if(bypass) { o += (left ? inL * gl : inR * gr); }
                 double tw = streamT0 + (w + 1) / wr;
-                if(left) { outL = o; }
-                else { EmitOutput((outL + o) / 2, tw); }
+                if(left)
+                {
+                    txWordL = tword;
+                }
+                else
+                {
+                    // il DAC legge il treno di bit secondo il formato di R7, alla sua frequenza (R8)
+                    long di = dacMatch ? frame : (long)Math.Floor(frame * fsDac / fs);
+                    if(di != lastDacIdx)
+                    {
+                        lastDacIdx = di;
+                        CoreToDac(txWordL, tword, out dacL, out dacR);
+                    }
+                    double outLeft = outOn ? dacL * hl : 0, outRight = outOn ? dacR * hr : 0;
+                    if(bypass) { outLeft += inL * gl; outRight += inR * gr; }   // BYPASS: line in direttamente all'uscita
+                    EmitOutput((outLeft + outRight) / 2, tw);
+                }
 
                 // telemetria: occupazione massima della FIFO RX in ogni intervallo di 0,5 ms
                 long bin = (long)Math.Floor(tw / OccStep);
@@ -1729,15 +2023,6 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static double Noise()
         {
             return (rnd.NextDouble() - 0.5) * 6e-5;              // rumore del convertitore, circa -95 dBFS
-        }
-
-        private static uint Quantize(double x)
-        {
-            // campione a 24 bit in complemento a 2, allineato a sinistra nella parola a 32 bit
-            long s = (long)Math.Round(x * 8388608.0);
-            if(s > 8388607) { s = 8388607; }
-            if(s < -8388608) { s = -8388608; }
-            return (uint)((int)s << 8);
         }
 
         private static void EmitOutput(double mono, double t)
@@ -1804,12 +2089,14 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static readonly List<uint> txPending = new List<uint>();
         private static readonly List<short> pcm = new List<short>();
         private static readonly List<int> occ = new List<int>();
-        private static bool streaming, rxEn, txEn, txStarted, codecDirty, resetPending, halfPending, binOverflow;
+        private static bool streaming, rxEn, txEn, txStarted, codecDirty, resetPending, halfPending, binOverflow, warnedIer, warnedTse;
         private static uint clkCtrl, isr, ier, tdr;
         private static int rxHead, rxCount, txHead, txCount, binMax;
         private static long wordsDone, lostWords, underWords, occBin = -1;
         private static long lastRdfoZeroId = -10, lastTdfvZeroId = -10;
-        private static double streamT0, pcmT0, occT0, phase, sweepPos, inL, inR, outL, halfValue;
+        private static double streamT0, pcmT0, occT0, phase, sweepPos, inL, inR, halfValue, dacL, dacR;
+        private static uint rxWordL, rxWordR, txWordL;
+        private static long lastAdcIdx = -1, lastDacIdx = -1;
         private static string inType = "sine";
         private static double inFreq = 1000, inLevelDb = -12;
     }
@@ -1898,6 +2185,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         public void Write(byte[] data)
         {
             if(data.Length == 0) { return; }
+            CpuClock.Charge(I2cTime.Of(data.Length));
             pointer = data[0] >> 1;
             if(data.Length >= 2)
             {
@@ -1908,6 +2196,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
 
         public byte[] Read(int count = 1)
         {
+            CpuClock.Charge(I2cTime.Of(count));
             var v = AudioPath.CodecRead(pointer);
             var r = new byte[count];
             if(count > 0) { r[0] = (byte)((v >> 8) & 1); }

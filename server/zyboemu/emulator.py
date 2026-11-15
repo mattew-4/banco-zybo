@@ -154,6 +154,7 @@ class Emulator:
         self.instructions: int | None = None
         self.clock = "real"
         self.last_run: dict = {}
+        self._boot_error: str | None = None
         self._cmdq: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -227,9 +228,10 @@ class Emulator:
             threading.Thread(target=self._monitor_reader, args=(self.monitor, self._stop), daemon=True).start()
             threading.Thread(target=self._monitor_writer, args=(self.monitor, self._stop), daemon=True).start()
             # lo script di boot passa dal Monitor: i comandi successivi partono solo quando e' finito
+            self._boot_error = None
             self.send(f"include @{_rp(resc)}")
-            if not self._ready.wait(240):
-                self.on_log("error", "La piattaforma Zybo non si e' caricata in tempo (vedi log).")
+            if not self._ready.wait(240) or self._boot_error:
+                self.on_log("error", "La piattaforma Zybo non si e' caricata: " + (self._boot_error or "tempo scaduto (vedi log)"))
                 self.shutdown()
                 return False
 
@@ -284,6 +286,10 @@ class Emulator:
             f"globalTimer PlWriteNs {t['pl_write_ns']:.1f}",
             f'globalTimer ClockMode "{mode}"',
             "machine Reset",                       # reset di CPU e periferiche, orologio a 0
+            "cpu IsHalted false",                  # dopo un Data Abort la CPU era stata fermata: si riparte
+            # DDR "sporca" come sulla scheda (residui, non zeri): i primi 32 MB, dove stanno programma,
+            # stack e heap; i dati cambiano a ogni esecuzione
+            f"globalTimer ScrambleMemory 0x100000 0x2000000 {int(time.time() * 1000) & 0x7FFFFFFF}",
             f"sysbus LoadELF @{_rp(elf)}",         # come l'agente: ELF in DDR, PC = _vector_table
             *PS7_INIT_UART1,
         ]
@@ -419,6 +425,9 @@ class Emulator:
                 low = text.lower()
                 if "error" in low or "could not" in low or "exception" in low or "no such" in low:
                     self.on_log("monitor", text)
+                    if self.state == "booting" and not self._ready.is_set():
+                        self._boot_error = text            # un comando dello script di avvio e' fallito
+                        self._ready.set()
 
     def _stats_loop(self, stop):
         last = None

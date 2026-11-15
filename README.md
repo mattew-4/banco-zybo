@@ -188,8 +188,32 @@ quelle del modello: **verificale sulla scheda**.
 - **GIC:** il driver `XScuGic` scrive in `ICDICFR` il tipo di trigger nel formato del GIC v1 dello
   Zynq (`01` livello, `11` fronte), che il GIC di Renode non riconosce: il banco toglie il bit del
   modello 1-N (ininfluente su un solo core), così gli interrupt configurati con il driver arrivano.
-- **Diverso:** un trasferimento I2C finisce subito. Un accesso a un indirizzo della PL senza
-  periferica restituisce 0 (sulla scheda: errore di bus) e viene segnalato in giallo.
+- **I2C:** in tempo CPU ogni trasferimento dura quanto a 100 kHz (9 bit per byte); in tempo reale è
+  istantaneo.
+
+### Quando il programma è sbagliato
+
+Il banco non «aggiusta» gli errori: la scheda emulata sbaglia come quella vera.
+
+| Errore nel programma | Cosa succede (sulla scheda e nel banco) |
+|---|---|
+| Accesso a un indirizzo della PL dove non c'è nessun blocco | DECERR → Data Abort → il gestore del BSP si ferma in un ciclo infinito: **il programma si blocca** su quell'istruzione (il banco lo indica in rosso) |
+| Elaborazione troppo lenta, `usleep` o stampe lunghe nel ciclo audio | la FIFO RX si riempie, le parole si perdono, si sentono clic; dopo un numero dispari di parole perse sinistro e destro si scambiano |
+| I2S non abilitato, o `TDFD` scritto senza chiudere il pacchetto con `TLR` | il programma resta bloccato in attesa in `read_sample`/`write_sample` |
+| `TLR` diverso dai byte scritti | errore TSE nel registro di stato della FIFO |
+| Codec non attivato (`R9`), spento (`R6`) o silenziato (`R5`) | silenzio in ingresso e/o in uscita |
+| Formato del codec sbagliato (`R7`: left/right-justified, DSP) | i bit finiscono nella posizione sbagliata: campioni scalati o distorti, canali scambiati |
+| Codec in modo master (`R7`) | codec e controllore pilotano entrambi i clock: dati senza senso, rumore |
+| Frequenza del codec diversa da LRCLK (`R8`) | l'ADC e il DAC campionano alla frequenza sbagliata: suono distorto «a gradini» |
+| Guadagno di ingresso troppo alto | saturazione del convertitore |
+| Indirizzo I2C del codec sbagliato | NACK: `audio_init` fallisce |
+| Variabile locale non inizializzata | contiene residui della memoria (la DDR non è azzerata), non 0 |
+| Programma che finisce con `while (1);` | la UART finisce comunque di trasmettere ciò che ha nella FIFO |
+
+**Cosa il banco non riproduce:** le cache (tempi un po' più regolari e, a N grandi, più bassi
+della scheda), la seconda FIFO del design e gli interrupt delle FIFO (segnalati quando il programma
+li usa), e un gestore di Data Abort scritto dal programma (il banco ferma la CPU come il gestore
+predefinito del BSP).
 
 **Il banco serve per provare e capire il codice. I risultati da consegnare, soprattutto le misure
 di tempo, vanno verificati sulla scheda vera.**

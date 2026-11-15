@@ -24,6 +24,12 @@ def _opt(name, default=None):
 expect = []
 while "--expect" in sys.argv:
     expect.append(_opt("--expect"))
+expect_not = []                          # testi che NON devono comparire (es. dopo un Data Abort)
+while "--expect-not" in sys.argv:
+    expect_not.append(_opt("--expect-not"))
+expect_abort = "--expect-abort" in sys.argv
+if expect_abort:
+    sys.argv.remove("--expect-abort")
 clock = _opt("--clock", "auto")          # auto | real | cpu
 audio_in = _opt("--input")               # es. "sine 1000 -12"
 
@@ -52,7 +58,35 @@ logs = []
 lock = threading.Lock()
 
 
-audio = {"chunks": 0, "seconds": 0.0, "maxocc": 0, "ovf_bins": 0, "last": None, "codec": None}
+audio = {"chunks": 0, "seconds": 0.0, "maxocc": 0, "ovf_bins": 0, "last": None, "codec": None, "pcm": []}
+
+
+def _fft(x):
+    n = len(x)
+    if n == 1:
+        return x
+    even, odd = _fft(x[0::2]), _fft(x[1::2])
+    import cmath
+    t = [cmath.exp(-2j * cmath.pi * k / n) * odd[k] for k in range(n // 2)]
+    return [even[k] + t[k] for k in range(n // 2)] + [even[k] - t[k] for k in range(n // 2)]
+
+
+def analyze_headphones(pcm, rate=24000, n=8192):
+    """Livello, frequenza dominante e THD+N (dB) delle ultime n uscite delle cuffie."""
+    import math
+    if len(pcm) < n:
+        return None
+    x = pcm[-n:]
+    rms = math.sqrt(sum(v * v for v in x) / n)
+    if rms < 1e-6:
+        return {"rms_db": -120.0, "freq": 0.0, "thdn_db": None}
+    w = [x[i] * (0.5 - 0.5 * math.cos(2 * math.pi * i / n)) for i in range(n)]
+    p = [abs(c) ** 2 for c in _fft(w)[: n // 2]]
+    k = max(range(2, n // 2), key=lambda i: p[i])
+    sig = sum(p[max(0, k - 4):k + 5])
+    rest = sum(p[2:]) - sig
+    return {"rms_db": 20 * math.log10(rms), "freq": k * rate / n,
+            "thdn_db": 10 * math.log10(max(rest, 1e-30) / max(sig, 1e-30))}
 
 
 def on_event(e):
@@ -62,6 +96,10 @@ def on_event(e):
             uart.extend(base64.b64decode(e["b64"]))
             return
         if e.get("t") == "audio":
+            import base64
+            raw = base64.b64decode(e.get("pcm", ""))
+            audio["pcm"].extend(int.from_bytes(raw[i:i + 2], "little", signed=True) / 32768 for i in range(0, len(raw) - 1, 2))
+            del audio["pcm"][:-16384]
             audio["chunks"] += 1
             audio["seconds"] += len(e.get("pcm", "")) * 3 / 4 / 2 / e.get("rate", 24000)
             occ = e.get("occ", [])
@@ -125,7 +163,7 @@ with lock:
         kinds[e.get("t")] = kinds.get(e.get("t"), 0) + 1
     print("== EVENTI per tipo:", kinds)
     for wall, e in events:
-        if e.get("t") in ("out", "irq", "in", "pin", "state", "cpu", "unmapped", "i2c"):
+        if e.get("t") in ("out", "irq", "in", "pin", "state", "cpu", "unmapped", "i2c", "abort", "warn"):
             print("   %6.2fs  %s" % (wall - t0, e))
     stats = [e for _, e in events if e.get("t") == "stats"]
     if stats:
@@ -144,8 +182,21 @@ with lock:
               "FIFO RX max %d, intervalli con perdite %d" % (audio["seconds"], last.get("now", 0), last.get("lost", 0),
                                                             last.get("under", 0), audio["maxocc"], audio["ovf_bins"]))
         print("   codec:", audio["codec"])
+        hp = analyze_headphones(audio["pcm"])
+        if hp:
+            print("== CUFFIE: livello %.1f dBFS, frequenza dominante %.0f Hz, THD+N %s" % (
+                hp["rms_db"], hp["freq"], "-" if hp["thdn_db"] is None else "%.1f dB" % hp["thdn_db"]))
 
 missing = [e for e in expect if e not in text]
-if expect:
-    print("== VERIFICA:", "OK" if not missing else "MANCANO %r" % missing)
-sys.exit(1 if missing or not ok else 0)
+present = [e for e in expect_not if e in text]
+aborted = any(e.get("t") == "abort" for _, e in events)
+problems = []
+if missing:
+    problems.append("MANCANO %r" % missing)
+if present:
+    problems.append("NON DOVEVANO COMPARIRE %r" % present)
+if expect_abort and not aborted:
+    problems.append("NESSUN DATA ABORT")
+if expect or expect_not or expect_abort:
+    print("== VERIFICA:", "OK" if not problems else "; ".join(problems))
+sys.exit(1 if problems or not ok else 0)

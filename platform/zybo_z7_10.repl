@@ -143,6 +143,31 @@ audioFifo: Zybo.AxiFifoMmS @ sysbus 0x43C00000
 
 i2s: Zybo.AxiI2sAdi @ sysbus 0x43C10000
 
+// Seconda AXI4-Stream FIFO del design (0x43C2_0000, IRQ 64): c'e' sulla scheda ma i suoi
+// collegamenti non sono noti, quindi non e' emulata: legge 0 e l'accesso viene segnalato
+audioFifo1: Zybo.BusErrorRegion @ sysbus <0x43C20000, +0x10000>
+    baseAddress: 0x43C20000
+    size: 0x10000
+    label: "axi_fifo_mm_s_1 (non emulata)"
+    abort: false
+
+// Il resto della PL (M_AXI_GP0 e GP1) e' vuoto: DECERR -> Data Abort -> programma bloccato
+plEmpty0: Zybo.BusErrorRegion @ sysbus <0x40000000, +0x01200000>
+    baseAddress: 0x40000000
+    size: 0x01200000
+
+plEmpty1: Zybo.BusErrorRegion @ sysbus <0x41230000, +0x029D0000>
+    baseAddress: 0x41230000
+    size: 0x029D0000
+
+plEmpty2: Zybo.BusErrorRegion @ sysbus <0x43C30000, +0x3C3D0000>
+    baseAddress: 0x43C30000
+    size: 0x3C3D0000
+
+plEmpty3: Zybo.BusErrorRegion @ sysbus <0x80000000, +0x40000000>
+    baseAddress: 0x80000000
+    size: 0x40000000
+
 // LD4 sul pin MIO7 del GPIO del PS
 ld4: Zybo.PinProbe
     uiName: "ld4"
