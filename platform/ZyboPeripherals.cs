@@ -261,6 +261,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
                 lastRenode = RenodeSeconds;
                 cacheBase = CacheModel.TotalCycles;
                 pmuPending = 0;
+                idlePending = 0;
             }
         }
 
@@ -271,8 +272,25 @@ namespace Antmicro.Renode.Peripherals.Zybo
             // CPU ferma (ciclo vuoto, WFI): le istruzioni non avanzano ma il tempo della scheda si',
             // al passo del tempo virtuale di Renode. Senza questo, un programma che finisce con
             // "while (1);" fermerebbe anche UART e flusso audio, cosa che sulla scheda non succede.
+            // Renode aggiorna tempo virtuale e contatore di istruzioni a fine quanto, non nello stesso
+            // istante: letto da un altro thread, il contatore puo' sembrare fermo per un quanto anche a
+            // CPU attiva. Si conta il tempo solo se le istruzioni restano ferme oltre IdleThreshold
+            // (poi tutto, comprese le prime frazioni); se ripartono prima era un falso allarme.
             double rv = RenodeSeconds;
-            if(i == lastInstr && rv > lastRenode) { extra += rv - lastRenode; AddPmu(rv - lastRenode); }
+            if(i == lastInstr)
+            {
+                if(rv > lastRenode) { idlePending += rv - lastRenode; }
+                if(idlePending > IdleThreshold)
+                {
+                    extra += idlePending;
+                    AddPmu(idlePending);
+                    idlePending = 0;
+                }
+            }
+            else
+            {
+                idlePending = 0;
+            }
             lastInstr = i;
             lastRenode = rv;
             long cc = CacheModel.TotalCycles;
@@ -287,7 +305,8 @@ namespace Antmicro.Renode.Peripherals.Zybo
         private static ICPU cpu;
         private static IMachine machine;
         private static ulong instrBase, lastInstr;
-        private static double lastRenode, pmuPending;
+        private static double lastRenode, pmuPending, idlePending;
+        private const double IdleThreshold = 0.5e-3;         // 0,5 ms di tempo virtuale: diversi quanti di Renode
         private static long cacheBase;
         private static double baseSeconds, extra, last;
     }

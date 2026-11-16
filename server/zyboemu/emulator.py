@@ -18,6 +18,7 @@ import os
 import pathlib
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -201,6 +202,7 @@ class Emulator:
         self.last_run: dict = {}
         self._boot_error: str | None = None
         self.cache_model = False
+        self._last_out: list = []                  # ultime righe scritte da Renode (diagnosi)
         self._cmdq: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -257,6 +259,17 @@ class Emulator:
 
             env = dict(os.environ)
             env["ZYBO_UI_PORT"] = str(ui_port)
+            # Cartella temporanea propria, nuova a ogni avvio. All'avvio Renode controlla le cartelle
+            # "renode-<PID>" lasciate in %TEMP% dalle esecuzioni precedenti e chiede a Windows se quei
+            # processi sono vivi: dopo un riavvio il PID puo' appartenere a un servizio protetto, la
+            # domanda riceve "Accesso negato" e Renode si chiude subito.
+            tmp_root = work / "renode-tmp"
+            for old in tmp_root.glob("*"):
+                shutil.rmtree(old, ignore_errors=True)    # quella di un Renode ancora acceso resta
+            tmp = tmp_root / f"{os.getpid()}-{int(time.time() * 1000)}"
+            tmp.mkdir(parents=True, exist_ok=True)
+            env["TMP"] = env["TEMP"] = env["TMPDIR"] = str(tmp)
+            self._last_out = []
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             self.proc = subprocess.Popen(
                 [str(renode), "--disable-gui", "--plain", "-P", str(mon_port)],
@@ -267,7 +280,8 @@ class Emulator:
 
             self.monitor = self._connect(mon_port, 120)
             if not self.monitor:
-                self.on_log("error", "Renode non risponde sulla porta del Monitor.")
+                cause = next((l.strip() for l in reversed(self._last_out) if "Exception" in l or "rror" in l), "")
+                self.on_log("error", "Renode non risponde sulla porta del Monitor." + (f" ({cause[:200]})" if cause else ""))
                 self.shutdown()
                 return False
             self._ready = threading.Event()
@@ -276,7 +290,18 @@ class Emulator:
             # lo script di boot passa dal Monitor: i comandi successivi partono solo quando e' finito
             self._boot_error = None
             self.send(f"include @{_rp(resc)}")
-            if not self._ready.wait(240) or self._boot_error:
+            deadline = time.time() + 240
+            while not self._ready.wait(0.5):
+                if self.proc.poll() is not None:
+                    # Renode si e' chiuso durante l'avvio: lo si dice subito, con la causa
+                    msgs = [l.strip() for l in self._last_out if l.strip() and not l.strip().startswith("at ")]
+                    cause = next((l for l in reversed(msgs) if "negato" in l or "denied" in l), "") or \
+                        next((l for l in reversed(msgs) if "Exception" in l or "rror" in l), "")
+                    self._boot_error = "Renode si e' chiuso durante l'avvio" + (f" ({cause[:200]})" if cause else "")
+                    break
+                if time.time() > deadline:
+                    break
+            if not self._ready.is_set() or self._boot_error:
                 self.on_log("error", "La piattaforma Zybo non si e' caricata: " + (self._boot_error or "tempo scaduto (vedi log)"))
                 self.shutdown()
                 return False
@@ -539,6 +564,8 @@ class Emulator:
             line = raw.decode("utf-8", "replace").rstrip()
             if not line:
                 continue
+            self._last_out.append(line)
+            del self._last_out[:-40]
             m = self._UNMAPPED.search(line)
             if m:
                 self.on_event({"t": "unmapped", "pc": m.group(1), "op": m.group(2), "size": m.group(3),
