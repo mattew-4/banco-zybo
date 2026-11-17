@@ -146,14 +146,15 @@ namespace Antmicro.Renode.Peripherals.Zybo
     // Tempo del Cortex-A9 (modalita' Cpu):
     //   t = istruzioni eseguite * CPI / f_CPU  +  latenze degli accessi ai registri  +  attese saltate
     // Il contatore di istruzioni di Renode e' esatto al confine di ogni blocco di codice.
-    // Taratura (README, "Lab 3"): CPI medio dai 157 us dell'FFT N = 512 a -O2 misurati
-    // sulla scheda; latenze dei registri della PL (bus M_AXI_GP0 + AXI4-Stream FIFO)
-    // scelte perche' a N = 4096, -O2 l'FFT stia sotto i 2666 us e si perdano comunque
-    // campioni, come descritto nel Lab 3. Le cache non sono modellate.
+    // Taratura (README, "Lab 3"): CPI medio dalla riga "fft avg 157 max 158 us" del testo
+    // del Lab 3 (main.c della sessione guidata, N = 512, -O2); latenze dei registri della PL
+    // (bus M_AXI_GP0 + AXI4-Stream FIFO) scelte perche' a N = 4096, -O2 l'FFT stia sotto i
+    // 2666 us e si perdano comunque campioni (lost = 375), come descritto nel Lab 3.
+    // Le cache sono modellate solo se attivo CacheModel.
     // ------------------------------------------------------------------
     public static class CpuClock
     {
-        public static double CyclesPerInstruction = 1.51;
+        public static double CyclesPerInstruction = 1.455;
         public static double CpuHz = 666666687;
         public static double PlReadSeconds = 1.0e-6;      // lettura di un registro nella PL
         public static double PlWriteSeconds = 0.7e-6;     // scrittura (memoria strongly-ordered: attende la risposta)
@@ -867,7 +868,7 @@ namespace Antmicro.Renode.Peripherals.Zybo
         // Controllo dell'orologio della scheda dal Monitor:
         //   globalTimer ClockPause / globalTimer ClockResume / globalTimer BoardSeconds
         //   globalTimer ClockMode "cpu" | "real"   (prima di "machine Reset")
-        //   globalTimer CyclesPerInstruction 1.51, PlReadNs 1000, PlWriteNs 700  (taratura)
+        //   globalTimer CyclesPerInstruction 1.455, PlReadNs 1000, PlWriteNs 700  (taratura)
         public void ClockPause() { BoardClock.Pause(); }
         public void ClockResume() { BoardClock.Resume(); }
         public double BoardSeconds { get { return BoardClock.Seconds; } }

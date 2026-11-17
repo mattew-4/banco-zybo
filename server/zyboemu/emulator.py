@@ -39,12 +39,12 @@ PS7_INIT_UART1 = [
 ]
 
 # Modello dei tempi in modalita' "tempo CPU" (README, "Lab 3"):
-#   cpi          cicli medi per istruzione a 667 MHz: 1,51 riproduce i 157 us dell'FFT N = 512 a -O2
-#                misurati sulla scheda (testo del Lab 3)
+#   cpi          cicli medi per istruzione a 667 MHz: 1,455 riproduce la riga del testo del Lab 3
+#                "fft avg 157 max 158 us" (FFT + picco, N = 512, -O2) con il main.c della sessione guidata
 #   pl_read_ns   lettura di un registro nella PL (bus M_AXI_GP0, AXI4-Stream FIFO, AXI GPIO)
 #   pl_write_ns  scrittura (memoria strongly-ordered: il processore attende la risposta)
-TIMING_DEFAULTS = {"cpi": 1.51, "pl_read_ns": 1000.0, "pl_write_ns": 700.0,
-                   "l2_hit_cycles": 25.0, "ddr_cycles": 60.0, "cache": 2.0, "cpi_cache": 1.40}
+TIMING_DEFAULTS = {"cpi": 1.455, "pl_read_ns": 1000.0, "pl_write_ns": 700.0,
+                   "l2_hit_cycles": 25.0, "ddr_cycles": 60.0, "cache": 2.0, "cpi_cache": 1.355}
 
 _ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\xff[\xfb-\xfe].|\xff\xfa.*?\xff\xf0|[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
@@ -354,7 +354,7 @@ class Emulator:
         cache_on = mode == "cpu" and (t["cache"] == 1 or (t["cache"] >= 2 and uses_cache(elf)))
         self.cache_model = cache_on
         # con le cache modellate parte del tempo e' nei miss: il CPI medio e' piu' basso, tarato in
-        # modo che l'FFT del Lab 3 (N = 512, -O2) duri gli stessi 157 us
+        # modo che l'FFT del Lab 3 (N = 512, -O2) duri circa gli stessi 157 us
         cpi = t["cpi_cache"] if cache_on else t["cpi"]
         cmds = [
             "pause",

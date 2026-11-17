@@ -139,14 +139,14 @@ menu **Orologio** sotto l'editor.
 Il modello ha tre parametri. I valori predefiniti riproducono quanto descritto nel testo del Lab 3:
 | Parametro | Valore | Da dove viene |
 |---|---|---|
-| Cicli per istruzione | 1,51 | i 157 µs dell'FFT N = 512 a `-O2` misurati sulla scheda |
+| Cicli per istruzione | 1,455 | la riga «fft avg 157 max 158 us» del testo del Lab 3, riprodotta con il `main.c` della sessione guidata (N = 512, `-O2`) |
 | Lettura di un registro della PL | 1 µs | bus M_AXI_GP0 + AXI4-Stream FIFO |
 | Scrittura di un registro della PL | 0,7 µs | memoria strongly-ordered: il processore attende la risposta |
 
 Se misuri valori diversi sulla scheda, puoi cambiarli in `config.json`, nella cartella del banco:
 ```json
-{ "timing": { "cpi": 1.51, "pl_read_ns": 1000, "pl_write_ns": 700,
-              "cpi_cache": 1.40, "l2_hit_cycles": 25, "ddr_cycles": 60, "cache": 2 } }
+{ "timing": { "cpi": 1.455, "pl_read_ns": 1000, "pl_write_ns": 700,
+              "cpi_cache": 1.355, "l2_hit_cycles": 25, "ddr_cycles": 60, "cache": 2 } }
 ```
 
 Il BSP del banco ha le stesse definizioni (`xparameters.h`) del BSP generato per il bitstream del
@@ -175,8 +175,8 @@ usa il tempo CPU e attiva un modello delle cache dati:
   miss e attese sui registri, con il divisore per 64 di `PMCR.D`; gli eventi `0x03` (refill L1D) e
   `0x04` (accesso L1D) sono contati dal modello.
 
-Con il modello attivo il CPI medio è più basso (`cpi_cache`: 1,40), perché parte del tempo è nei
-miss: l'FFT N = 512 a `-O2` dura sempre 157 µs, ma ora `max` supera `avg` e a N = 4096 i dati
+Con il modello attivo il CPI medio è più basso (`cpi_cache`: 1,355), perché parte del tempo è nei
+miss: l'FFT N = 512 a `-O2` dura sempre circa 157 µs, ma ora `max` supera `avg` e a N = 4096 i dati
 escono dalla L1 (circa 2100 µs). La prova `tests/cache_pmu.c` mostra la gerarchia: 12 ns per
 accesso in L1, 50 in L2, 77 oltre la L2, 138 con la cache spenta.
 
