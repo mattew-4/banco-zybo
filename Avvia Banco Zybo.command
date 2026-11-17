@@ -1,6 +1,10 @@
 #!/bin/sh
 # Banco Zybo Z7-10 emulato -- avvio su macOS (doppio clic nel Finder) e Linux (./"Avvia Banco Zybo.command")
 cd "$(dirname "$0")" || exit 1
+
+# Tutto in un unico blocco { ... }: la shell lo legge per intero prima di eseguirlo,
+# cosi' l'aggiornamento automatico puo' sostituire anche questo file mentre e' in uso.
+{
 echo "Banco Zybo Z7-10 emulato"
 echo
 
@@ -17,6 +21,9 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
+# scarica da GitHub l'ultima versione del banco, se ce n'e' una nuova
+"$PY" -I update.py
+
 # la prima volta scarica compilatore ed emulatore (circa 400 MB); poi non fa niente
 if ! "$PY" -I setup.py; then
     printf "Premi Invio per chiudere. "; read -r _
@@ -27,3 +34,4 @@ echo "Si apre nel browser su http://127.0.0.1:8765/"
 echo "Per spegnere tutto: Ctrl+C oppure chiudi questa finestra."
 echo
 exec "$PY" -I server/app.py
+}

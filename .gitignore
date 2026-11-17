@@ -6,6 +6,9 @@ downloads/
 bsp/obj/
 # impostazioni personali (cartella dei Lab)
 config.json
+# versione installata dall'aggiornamento automatico (installazioni da ZIP)
+.banco-version.json
+*.part
 __pycache__/
 *.pyc
 .DS_Store

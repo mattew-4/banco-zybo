@@ -25,7 +25,8 @@ Funziona su **Windows**, **macOS** e **Linux**.
 Servono anche:
 - **Python 3.9 o più recente** (solo la libreria standard: niente `pip install`);
 - circa **1 GB di spazio libero**, e 2,5 GB durante la prima installazione;
-- **internet solo la prima volta**, per scaricare compilatore ed emulatore (circa 400 MB).
+- **internet la prima volta**, per scaricare compilatore ed emulatore (circa 400 MB); poi solo per
+  gli aggiornamenti automatici del banco, facoltativi.
 
 Non servono permessi di amministratore e non viene installato niente nel sistema.
 
@@ -84,6 +85,19 @@ git clone https://github.com/mattew-4/banco-zybo.git
 cd banco-zybo
 sh "Avvia Banco Zybo.command"
 ```
+
+### Aggiornamenti automatici
+
+Non c'è bisogno di riscaricare il banco quando esce una versione nuova: a ogni avvio
+`Avvia Banco Zybo` controlla su GitHub e, se c'è una versione più recente, la installa da sola
+(`git pull` se hai usato `git clone`, altrimenti scarica lo ZIP della versione nuova e sostituisce i
+file del banco). Compilatore ed emulatore (`tools/`), la cartella `work/` e le tue impostazioni
+(`config.json`) non vengono toccati. Senza internet il banco parte con la versione installata.
+
+Per disattivarlo scrivi `"auto_update": false` in `config.json`, nella cartella del banco.
+
+Chi ha scaricato il banco **prima del 17 novembre 2026** deve riscaricarlo un'ultima volta
+(o fare `git pull`): le versioni precedenti non avevano ancora l'aggiornamento automatico.
 
 ---
 

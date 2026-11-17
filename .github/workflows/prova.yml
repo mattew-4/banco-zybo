@@ -107,6 +107,30 @@ jobs:
             exit 1
           fi
 
+      - name: Aggiornamento automatico (installazione da ZIP)
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -e
+          git fetch --depth=2 origin main
+          # una installazione "da ZIP" alla versione precedente, con il nuovo update.py
+          git archive -o old.zip HEAD~1
+          git archive -o new.zip HEAD
+          python -I -c "import zipfile; zipfile.ZipFile('old.zip').extractall('zipinst'); zipfile.ZipFile('new.zip').extractall('ref')"
+          cp update.py zipinst/
+          for i in 1 2 3; do
+            python -I zipinst/update.py | tee upd.log
+            grep -q "banco aggiornato alla versione" upd.log && break
+            [ $i -lt 3 ] && sleep 30
+          done
+          grep -q "banco aggiornato alla versione" upd.log
+          # dopo l'aggiornamento deve essere identica alla versione pubblicata
+          python -I -c "
+          import filecmp, os, sys
+          bad = [os.path.join(d, f)[4:] for d, _, fs in os.walk('ref') for f in fs
+                 if not filecmp.cmp(os.path.join(d, f), os.path.join('zipinst', os.path.join(d, f)[4:]), shallow=False)]
+          print('file diversi:', bad); sys.exit(1 if bad else 0)"
+
       - name: Server web e chiusura di Renode (macOS/Linux)
         if: runner.os != 'Windows'
         shell: bash
